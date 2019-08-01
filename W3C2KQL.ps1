@@ -14,6 +14,7 @@
     
     .SYNOPSIS
     Author: Marcus Ferreira <marcus.ferreira@microsoft.com>
+            Paulo da Silva <pasiva@microsoft.com>
     Version: 0.1
 
     .DESCRIPTION
