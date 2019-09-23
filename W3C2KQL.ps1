@@ -13,8 +13,8 @@
     even if Microsoft has been advised of the possibility of such damages.
     
     .SYNOPSIS
-    Author: Marcus Ferreira <marcus.ferreira@microsoft.com>
-            Paulo da Silva <pasiva@microsoft.com>
+    Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
+            Paulo da Silva pasilva[at]microsoft[dot]com
     Version: 0.1
 
     .DESCRIPTION
