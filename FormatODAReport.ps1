@@ -81,8 +81,8 @@ Try {
 
     #Apply table style to used area
     $ListObject = $WB.ActiveSheet.ListObjects.Add([Microsoft.Office.Interop.Excel.XlListObjectSourceType]::xlSrcRange,
-                    $WS.Range("A2:" + [string]$(ExcelSeq($ColumnCount)) + $RowCount),
-                    $null , [Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlYes)
+        $WS.Range("A2:" + [string]$(ExcelSeq($ColumnCount)) + $RowCount),
+        $null , [Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlYes)
     $ListObject.Name = "TableData"
     $ListObject.TableStyle = "TableStyleMedium6"
 
@@ -142,7 +142,8 @@ Try {
 
             'Score' {
                 $ColumnLetter = [string]$(ExcelSeq($Column))
-                $null = $WS.Range($UsedArea).Sort($WS.Range($($ColumnLetter + 3)), 2, $WS.Range($($ColumnLetter + $RowCount)), $null, 1, $null, 2, 2)
+                $null = $WS.Range($UsedArea).Sort($WS.Range($($ColumnLetter + 3)), 2, 
+                    $WS.Range($($ColumnLetter + $RowCount)), $null, 1, $null, 2, 2)
                 $WS.Cells.EntireColumn.Item($Column).NumberFormat = "0.00"
                 $WS.Cells.EntireColumn.Item($Column).ColumnWidth = 16
 
