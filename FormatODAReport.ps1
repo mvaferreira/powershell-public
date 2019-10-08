@@ -207,9 +207,9 @@ Try {
                         }
 
                         'Low' {
-                            # BackgroundColor = Green (4)
+                            # BackgroundColor = Blue (33)
                             # ForegroundColor = Black (1)
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 4
+                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 33
                             $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
                         }
 
