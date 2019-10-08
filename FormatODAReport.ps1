@@ -14,6 +14,7 @@
     
     .SYNOPSIS
     Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
+            Paulo da Silva pasilva[at]microsoft[dot]com
     Version: 0.1
 
     .DESCRIPTION
@@ -28,16 +29,19 @@ Param(
     [string] $Report = ""
 )
 
+#Return if no report available to process
 If ($Report -And ($Report.Length -gt 1)) {
     If (-Not (Test-Path -Path $Report)) {
         Write-Host "File $($Report) not found."
         return
     }
-} Else {
+}
+Else {
     Write-Host "Specify a report to process."
     return
 }
 
+#Get excel letter sequence for column index
 Function ExcelSeq($col) {
     While ($col -gt 0) {
         $curLetterNum = ($col - 1) % 26;
@@ -48,7 +52,10 @@ Function ExcelSeq($col) {
     return $colString
 }
 
+#Logic Main
 Try {
+    Write-Host -NoNewline "Formatting worksheet..."
+    
     #Save new excel.exe PID
     $AllPIDs = Get-Process excel -ErrorAction Ignore | ForEach-Object { $_.Id }
     $XL = New-Object -ComObject Excel.Application
@@ -58,6 +65,7 @@ Try {
     $WB = $XL.Workbooks.Open($Report)
     $WS = $WB.Worksheets.Item("AssessmentWorkSheet")
 
+    #Get used row and column count
     $RowCount = $WS.UsedRange.Rows.Count
     $ColumnCount = $WS.UsedRange.Columns.Count
 
@@ -66,18 +74,22 @@ Try {
     #UsedArea = A3:L(numOfRows) (Ex. 'A3:L142')
     $UsedArea = [string]$(ExcelSeq(1)) + "3:" + [string]$(ExcelSeq($ColumnCount)) + $RowCount
 
-    #Logic Main
-    Write-Host -NoNewline "Formatting worksheet..."
-
     #Merge title cells and apply alignment
     $WS.Range("A1:" + [string]$(ExcelSeq($ColumnCount)) + "1").MergeCells = $True
     $WS.Range("A1:" + [string]$(ExcelSeq($ColumnCount)) + "1").HorizontalAlignment = -4131
     $WS.Range("A1:" + [string]$(ExcelSeq($ColumnCount)) + "1").VerticalAlignment = -4160
 
     #Apply table style to used area
-    $ListObject = $WB.ActiveSheet.ListObjects.Add([Microsoft.Office.Interop.Excel.XlListObjectSourceType]::xlSrcRange, $WS.Range("A2:" + [string]$(ExcelSeq($ColumnCount)) + $RowCount), $null ,[Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlYes)
+    $ListObject = $WB.ActiveSheet.ListObjects.Add([Microsoft.Office.Interop.Excel.XlListObjectSourceType]::xlSrcRange,
+                    $WS.Range("A2:" + [string]$(ExcelSeq($ColumnCount)) + $RowCount),
+                    $null , [Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlYes)
     $ListObject.Name = "TableData"
     $ListObject.TableStyle = "TableStyleMedium6"
+
+    #Set fixed row height to 180
+    For ($Row = 3; $Row -le $RowCount; $Row++) {
+        $WS.Cells.EntireRow.Item($Row).RowHeight = 180
+    }
 
     #Loop through all columns and format them as needed
     For ($Column = 1; $Column -le $ColumnCount; $Column++) {
@@ -103,18 +115,16 @@ Try {
                 $WS.Cells.EntireColumn.Item($Column).ColumnWidth = 16
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
-                $WS.Cells.Item(2,$Column).HorizontalAlignment = -4131
+                $WS.Cells.Item(2, $Column).HorizontalAlignment = -4131
 
                 For ($Row = 3; $Row -le $RowCount; $Row++) {
                     Switch ($WS.Cells.Item($Row, $Column).Value2) {
                         'Failed' {
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 15
-                            $WS.Cells.Item($Row, $Column).Font.ColorIndex = 3
+                            $WS.Cells.Item($Row, $Column).Style = "Bad"
                         }
 
                         'Passed' {
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 4
-                            $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
+                            $WS.Cells.Item($Row, $Column).Style = "Good"
                         }
                     }
                 }
@@ -143,21 +153,21 @@ Try {
 
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
-                $WS.Cells.Item(2,$Column).HorizontalAlignment = -4131
+                $WS.Cells.Item(2, $Column).HorizontalAlignment = -4131
             }
 
             'Probability' {
                 $WS.Cells.EntireColumn.Item($Column).ColumnWidth = 16
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
-                $WS.Cells.Item(2,$Column).HorizontalAlignment = -4131
+                $WS.Cells.Item(2, $Column).HorizontalAlignment = -4131
             }
 
             'Impact' {
                 $WS.Cells.EntireColumn.Item($Column).ColumnWidth = 16
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
-                $WS.Cells.Item(2,$Column).HorizontalAlignment = -4131
+                $WS.Cells.Item(2, $Column).HorizontalAlignment = -4131
 
                 For ($Row = 3; $Row -le $RowCount; $Row++) {
                     Switch ($WS.Cells.Item($Row, $Column).Value2) {
@@ -218,7 +228,7 @@ Try {
                 $WS.Cells.EntireColumn.Item($Column).ColumnWidth = 16
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
-                $WS.Cells.Item(2,$Column).HorizontalAlignment = -4131
+                $WS.Cells.Item(2, $Column).HorizontalAlignment = -4131
             }
 
             'Technology' {
@@ -226,14 +236,14 @@ Try {
                 $WS.Cells.EntireColumn.Item($Column).WrapText = $True
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
-                $WS.Cells.Item(2,$Column).HorizontalAlignment = -4131
+                $WS.Cells.Item(2, $Column).HorizontalAlignment = -4131
             }
 
             'Source' {
                 $WS.Cells.EntireColumn.Item($Column).ColumnWidth = 16
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
-                $WS.Cells.Item(2,$Column).HorizontalAlignment = -4131
+                $WS.Cells.Item(2, $Column).HorizontalAlignment = -4131
             }
         }
     }
@@ -278,3 +288,4 @@ Do {
 } While (Get-Process -Id $ExcelPID -ErrorAction Ignore)
 
 Write-Host "done!"
+Write-Host "New version available at $($NewFileName)"
