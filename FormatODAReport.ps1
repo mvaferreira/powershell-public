@@ -14,7 +14,7 @@
     
     .SYNOPSIS
     Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-    Version: 0.1
+    Version: 0.2
 
     .DESCRIPTION
     This script will nicely format the OnDemandAssessment (ODA) excel report.
@@ -51,6 +51,129 @@ Function ExcelSeq($col) {
     return $colString
 }
 
+Function Get-RGB { 
+    Param( 
+        [Parameter(Mandatory = $false)] 
+        [ValidateRange(0, 255)] 
+        [Int] 
+        $Red = 0, 
+        [Parameter(Mandatory = $false)] 
+        [ValidateRange(0, 255)] 
+        [Int] 
+        $Green = 0,
+        [Parameter(Mandatory = $false)] 
+        [ValidateRange(0, 255)] 
+        [Int] 
+        $Blue = 0 
+    ) 
+    Process { 
+        [long]($Red + ($Green * 256) + ($Blue * 65536))
+    } 
+}
+
+Function CreatePivotTable($destSheet, $pivotName, $WSObj, $RowFields, $DataField, $DTFieldSummary, $DTFieldText, $ColumnFields) {
+    $xlDatabase = 1
+    $xlPivotTableVersion12 = 3
+    $PivotTable = $WB.PivotCaches().Create($xlDatabase, "TableData", $xlPivotTableVersion12)
+    Start-Sleep -Milliseconds 500
+    $destName = "'" + $destSheet + "'!R1C1"
+    $PivotTable.CreatePivotTable([string]$destName, $pivotName) | out-null
+    
+    $I = 1
+    ForEach ($Field In $RowFields) {
+        $WSObj.PivotTables($pivotName).PivotFields($Field).Orientation = [Microsoft.Office.Interop.Excel.XlPivotFieldOrientation]::xlRowField
+        $WSObj.PivotTables($pivotName).PivotFields($Field).Position = $I
+        $I++
+    }
+
+    $null = $WSObj.PivotTables($pivotName).AddDataField($WSObj.PivotTables($pivotName).PivotFields([string]$DataField),
+        [string]($DTFieldText), $DTFieldSummary)
+
+    #We have to loop again, after row fields were added
+    $I = 1
+    ForEach ($Field In $RowFields) {
+        If ($I -ne $RowFields.Count) {
+            $WSObj.PivotTables($pivotName).PivotFields($Field).ShowDetail = $False
+        }
+        $I++
+    }
+
+    If ($ColumnFields) {
+        $I = 1
+        ForEach ($Field In $ColumnFields) {
+            $WSObj.PivotTables($pivotName).PivotFields($Field).Orientation = [Microsoft.Office.Interop.Excel.XlPivotFieldOrientation]::xlColumnField
+            $WSObj.PivotTables($pivotName).PivotFields($Field).Position = $I
+            $I++
+        }
+
+        $I = 1
+        ForEach ($Field In $ColumnFields) {
+            If ($I -ne $ColumnFields.Count) {
+                $WSObj.PivotTables($pivotName).PivotFields($Field).ShowDetail = $False
+            }
+            $I++
+        }
+    }
+
+    [int]$ChartWidth = 600
+    [int]$ChartHeight = 400
+    $chartType = [Microsoft.Office.Interop.Excel.XlChartType]::xlColumnStacked
+
+    $chart = $WSObj.Shapes.AddChart().Chart
+    $chart.ShowReportFilterFieldButtons = $False
+    $chart.ShowLegendFieldButtons = $False
+    $chart.ShowAxisFieldButtons = $False
+    $chart.ShowValueFieldButtons = $False
+    $chart.ShowAllFieldButtons = $False
+    $chart.ShowExpandCollapseEntireFieldButtons = $False
+    $chart.ChartType = $chartType
+    $chart.HasTitle = $True
+    $chart.ChartTitle.Text = $destSheet
+
+    $chart.SeriesCollection(1) | ForEach-Object {
+        If ($_.XValues) {
+            $I = 1
+            ForEach ($Value In $_.XValues) {
+                Switch ($Value) {
+                    'Catastrophic' {
+                        $chart.SeriesCollection(1).Points($I).Format.Fill.ForeColor.RGB = $(Get-RGB 139 0 0)
+                    }
+
+                    'Very High' {
+                        $chart.SeriesCollection(1).Points($I).Format.Fill.ForeColor.RGB = $(Get-RGB 178 34 34)
+                    }
+                    
+                    'High' {
+                        $chart.SeriesCollection(1).Points($I).Format.Fill.ForeColor.RGB = $(Get-RGB 255 0 0)
+                    }
+
+                    'Moderate' {
+                        $chart.SeriesCollection(1).Points($I).Format.Fill.ForeColor.RGB = $(Get-RGB 255 140 0)
+                    }
+
+                    'Low to Moderate' {
+                        $chart.SeriesCollection(1).Points($I).Format.Fill.ForeColor.RGB = $(Get-RGB 218 165 32)
+                    }
+
+                    'Low' {
+                        $chart.SeriesCollection(1).Points($I).Format.Fill.ForeColor.RGB = $(Get-RGB 30 144 255)
+                    }
+
+                    'Very Low' {
+                        $chart.SeriesCollection(1).Points($I).Format.Fill.ForeColor.RGB = $(Get-RGB 135 206 250)
+                    }                                     
+                }
+                $I++
+            }
+        }
+    }
+
+    $WSObj.Shapes.Item("Chart 1").Top = 50
+    $WSObj.Shapes.Item("Chart 1").Width = $ChartWidth
+    $WSObj.Shapes.Item("Chart 1").Height = $ChartHeight
+    
+}
+
 #Logic Main
 Try {
     Write-Host -NoNewline "Formatting worksheet..."
@@ -62,7 +185,8 @@ Try {
 
     $XL.Visible = $False
     $WB = $XL.Workbooks.Open($Report)
-    $WS = $WB.Worksheets.Item("AssessmentWorkSheet")
+    $DataSheetName = "AssessmentWorkSheet"
+    $WS = $WB.Worksheets.Item($DataSheetName)
 
     #Get used row and column count
     $RowCount = $WS.UsedRange.Rows.Count
@@ -143,7 +267,7 @@ Try {
                 $ColumnLetter = [string]$(ExcelSeq($Column))
                 $null = $WS.Range($UsedArea).Sort($WS.Range($($ColumnLetter + 3)), 2, 
                     $WS.Range($($ColumnLetter + $RowCount)), $null, 1, $null, 2, 2)
-                $WS.Cells.EntireColumn.Item($Column).NumberFormat = "0.00"
+                $WS.Cells.EntireColumn.Item($Column).NumberFormat = "0.0"
                 $WS.Cells.EntireColumn.Item($Column).ColumnWidth = 16
 
                 For ($Row = 3; $Row -le $RowCount; $Row++) {
@@ -172,51 +296,51 @@ Try {
                 For ($Row = 3; $Row -le $RowCount; $Row++) {
                     Switch ($WS.Cells.Item($Row, $Column).Value2) {
                         'Catastrophic' {
-                            # BackgroundColor = Red (3)
+                            # BackgroundColor = RGB 139 0 0
                             # ForegroundColor = Black (1)
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 3
+                            $WS.Cells.Item($Row, $Column).Interior.Color = $(Get-RGB 139 0 0)
                             $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
                         }
 
                         'Very High' {
-                            # BackgroundColor = Red (3)
+                            # BackgroundColor = RGB 178 34 34
                             # ForegroundColor = Black (1)
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 3
+                            $WS.Cells.Item($Row, $Column).Interior.Color = $(Get-RGB 178 34 34)
                             $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
                         }
 
                         'High' {
-                            # BackgroundColor = Dark Orange (46)
+                            # BackgroundColor = RGB 255 0 0
                             # ForegroundColor = Black (1)
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 46
+                            $WS.Cells.Item($Row, $Column).Interior.Color = $(Get-RGB 255 0 0)
                             $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
                         }
 
                         'Moderate' {
-                            # BackgroundColor = Light Orange (45)
+                            # BackgroundColor = RGB 255 140 0
                             # ForegroundColor = Black (1)
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 45
+                            $WS.Cells.Item($Row, $Column).Interior.Color = $(Get-RGB 255 140 0)
                             $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
                         }
 
                         'Low to Moderate' {
-                            # BackgroundColor = Yellow (6)
+                            # BackgroundColor = RGB 218 165 32
                             # ForegroundColor = Black (1)
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 6
+                            $WS.Cells.Item($Row, $Column).Interior.Color = $(Get-RGB 218 165 32)
                             $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
                         }
 
                         'Low' {
-                            # BackgroundColor = Blue (33)
+                            # BackgroundColor = RBG 30 144 255
                             # ForegroundColor = Black (1)
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 33
+                            $WS.Cells.Item($Row, $Column).Interior.Color = $(Get-RGB 30 144 255)
                             $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
                         }
 
                         'Very Low' {
-                            # BackgroundColor = Light Blue (8)
+                            # BackgroundColor = RBG 135 206 250
                             # ForegroundColor = Black (1)
-                            $WS.Cells.Item($Row, $Column).Interior.ColorIndex = 8
+                            $WS.Cells.Item($Row, $Column).Interior.Color = $(Get-RGB 135 206 250)
                             $WS.Cells.Item($Row, $Column).Font.ColorIndex = 1
                         }
                     }
@@ -247,6 +371,50 @@ Try {
             }
         }
     }
+
+    #Add PivotTables
+
+    #region 'Recommendations by Effort'
+    $WSName = "Recommendations by Effort"
+    $WSPT = $WB.Worksheets.Add()
+    $WSPT.Name = $WSName
+
+    $pivotTableName = "EffortPivotTable"
+    $RowFields = @("Effort", "Focus Area", "Content and Best Practices")
+    $DataField = "Score"
+    $DataFieldText = [string]"Sum of " + $DataField
+    $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlSum
+    CreatePivotTable $WSName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
+    #EndRegion 'Recommendations by Effort'
+
+    #region 'Recommendations by Impact'
+    $WSName = "Recommendations by Impact"
+    $WSPT = $WB.Worksheets.Add()
+    $WSPT.Name = $WSName
+
+    $pivotTableName = "ImpactPivotTable"
+    $RowFields = @("Impact", "Recommendation Title", "Content and Best Practices")
+    $DataField = "Score"
+    $DataFieldText = [string]"Sum of " + $DataField
+    $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlSum
+    CreatePivotTable $WSName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
+    #EndRegion 'Recommendations by Impact'
+
+    #region 'Recommendations by Focus Area'
+    $WSName = "Recommendations by Focus Area"
+    $WSPT = $WB.Worksheets.Add()
+    $WSPT.Name = $WSName
+
+    $pivotTableName = "FocusAreaPivotTable"
+    $RowFields = @("Focus Area", "Recommendation Title", "Content and Best Practices", "Affected Objects")
+    $DataField = "Score"
+    $DataFieldText = [string]"Count of " + $DataField
+    $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlCount
+    CreatePivotTable $WSName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
+    #EndRegion 'Recommendations by Focus Area'
+
+    $LastSheet = $WB.Worksheets | Select-Object -Last 1
+    $LastSheet.Move($WSPT)
 
     #Save and close workbook
     $ReportObj = Get-Item $Report
