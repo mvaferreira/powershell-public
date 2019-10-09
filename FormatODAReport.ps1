@@ -458,9 +458,17 @@ Catch {
     Write-Host $Error[0].Exception.Message
 
     #Make sure COM variables are released, so excel.exe is gone.
-    [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WS)
-    [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WB)
-    [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($XL)
+    If ($WS) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WS)}
+    If ($WB) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WB)}
+    If ($XL) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($XL)}
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+Finally {
+    #Make sure COM variables are released, so excel.exe is gone.
+    If ($WS) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WS) }
+    If ($WB) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WB) }
+    If ($XL) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($XL) }
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
 }
