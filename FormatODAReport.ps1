@@ -18,6 +18,8 @@
 
     .DESCRIPTION
     This script will nicely format the OnDemandAssessment (ODA) excel report.
+    Please refer to the following url for more information about OnDemandAssessments.
+    https://docs.microsoft.com/en-us/services-hub/health/getting_started_with_on_demand_assessments
     
     .EXAMPLE
     Provide the report path to the -Report parameter.
