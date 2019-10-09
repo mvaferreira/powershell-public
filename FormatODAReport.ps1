@@ -71,10 +71,10 @@ Function Get-RGB {
     } 
 }
 
-Function CreatePivotTable($destSheet, $pivotName, $WSObj, $RowFields, $DataField, $DTFieldSummary, $DTFieldText, $ColumnFields) {
+Function CreatePivotTable($destSheet, $DTName, $pivotName, $WSObj, $RowFields, $DataField, $DTFieldSummary, $DTFieldText, $ColumnFields) {
     $xlDatabase = 1
     $xlPivotTableVersion12 = 3
-    $PivotTable = $WB.PivotCaches().Create($xlDatabase, "TableData", $xlPivotTableVersion12)
+    $PivotTable = $WB.PivotCaches().Create($xlDatabase, $DTName, $xlPivotTableVersion12)
     Start-Sleep -Milliseconds 500
     $destName = "'" + $destSheet + "'!R1C1"
     $PivotTable.CreatePivotTable([string]$destName, $pivotName) | out-null
@@ -202,11 +202,20 @@ Try {
     $WS.Range("A1:" + [string]$(ExcelSeq($ColumnCount)) + "1").HorizontalAlignment = -4131
     $WS.Range("A1:" + [string]$(ExcelSeq($ColumnCount)) + "1").VerticalAlignment = -4160
 
+    $DataTableName = "TableAssessmentFindings"
+
+    #If table already exist, delete it
+    If ($WB.ActiveSheet.ListObjects.Count -gt 0) {
+        If ($WB.ActiveSheet.ListObjects($DataTableName)) {
+            $WB.ActiveSheet.ListObjects($DataTableName).Unlist()
+        }
+    }
+
     #Apply table style to used area
     $ListObject = $WB.ActiveSheet.ListObjects.Add([Microsoft.Office.Interop.Excel.XlListObjectSourceType]::xlSrcRange,
         $WS.Range("A2:" + [string]$(ExcelSeq($ColumnCount)) + $RowCount),
         $null , [Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlYes)
-    $ListObject.Name = "TableData"
+    $ListObject.Name = $DataTableName
     $ListObject.TableStyle = "TableStyleMedium6"
 
     #Set fixed row height to 180
@@ -372,49 +381,53 @@ Try {
         }
     }
 
-    #Add PivotTables
+    #Add PivotTables, if only found the Assessment worksheet
 
-    #region 'Recommendations by Effort'
-    $WSName = "Recommendations by Effort"
-    $WSPT = $WB.Worksheets.Add()
-    $WSPT.Name = $WSName
+    If ($WB.Worksheets.Count -eq 2) {
+        #region 'Recommendations by Effort'
+        $WSName = "Recommendations by Effort"
+        $WSPT = $WB.Worksheets.Add()
+        $WSPT.Name = $WSName
 
-    $pivotTableName = "EffortPivotTable"
-    $RowFields = @("Effort", "Focus Area", "Content and Best Practices")
-    $DataField = "Score"
-    $DataFieldText = [string]"Sum of " + $DataField
-    $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlSum
-    CreatePivotTable $WSName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
-    #EndRegion 'Recommendations by Effort'
+        $pivotTableName = "EffortPivotTable"
+        $RowFields = @("Effort", "Focus Area", "Content and Best Practices")
+        $DataField = "Score"
+        $DataFieldText = [string]"Count of " + $DataField
+        $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlCount
+        CreatePivotTable $WSName $DataTableName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
+        #EndRegion 'Recommendations by Effort'
 
-    #region 'Recommendations by Impact'
-    $WSName = "Recommendations by Impact"
-    $WSPT = $WB.Worksheets.Add()
-    $WSPT.Name = $WSName
+        #region 'Recommendations by Impact'
+        $WSName = "Recommendations by Impact"
+        $WSPT = $WB.Worksheets.Add()
+        $WSPT.Name = $WSName
 
-    $pivotTableName = "ImpactPivotTable"
-    $RowFields = @("Impact", "Recommendation Title", "Content and Best Practices")
-    $DataField = "Score"
-    $DataFieldText = [string]"Sum of " + $DataField
-    $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlSum
-    CreatePivotTable $WSName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
-    #EndRegion 'Recommendations by Impact'
+        $pivotTableName = "ImpactPivotTable"
+        $RowFields = @("Impact", "Recommendation Title", "Content and Best Practices")
+        $DataField = "Score"
+        $DataFieldText = [string]"Sum of " + $DataField
+        $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlSum
+        CreatePivotTable $WSName $DataTableName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
+        #EndRegion 'Recommendations by Impact'
 
-    #region 'Recommendations by Focus Area'
-    $WSName = "Recommendations by Focus Area"
-    $WSPT = $WB.Worksheets.Add()
-    $WSPT.Name = $WSName
+        #region 'Recommendations by Focus Area'
+        $WSName = "Recommendations by Focus Area"
+        $WSPT = $WB.Worksheets.Add()
+        $WSPT.Name = $WSName
 
-    $pivotTableName = "FocusAreaPivotTable"
-    $RowFields = @("Focus Area", "Recommendation Title", "Content and Best Practices", "Affected Objects")
-    $DataField = "Score"
-    $DataFieldText = [string]"Count of " + $DataField
-    $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlCount
-    CreatePivotTable $WSName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
-    #EndRegion 'Recommendations by Focus Area'
+        $pivotTableName = "FocusAreaPivotTable"
+        $RowFields = @("Focus Area", "Recommendation Title", "Content and Best Practices", "Affected Objects")
+        $DataField = "Score"
+        $DataFieldText = [string]"Count of " + $DataField
+        $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlCount
+        CreatePivotTable $WSName $DataTableName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
+        #EndRegion 'Recommendations by Focus Area'
 
-    $LastSheet = $WB.Worksheets | Select-Object -Last 1
-    $LastSheet.Move($WSPT)
+        $LastSheet = $WB.Worksheets | Select-Object -Last 1
+        $LastSheet.Move($WSPT)
+    } Else {
+        Write-Host "`r`nWarning! Make sure this report is not already formatted and there is only one worksheet.`r`nSkipping pivot tables worksheets."
+    }
 
     #Save and close workbook
     $ReportObj = Get-Item $Report
@@ -436,10 +449,13 @@ Try {
     [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($XL)
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
+
+    Write-Host "done!"
+    Write-Host "New version available at $($NewFileName)"
 }
 Catch {
     Write-Host "`r`n"
-    Write-Host $Error[0].Exception
+    Write-Host $Error[0].Exception.Message
 
     #Make sure COM variables are released, so excel.exe is gone.
     [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WS)
@@ -454,6 +470,3 @@ Do {
     Stop-Process -Id $ExcelPID -Force -ErrorAction Ignore
     Start-Sleep -Milliseconds 100
 } While (Get-Process -Id $ExcelPID -ErrorAction Ignore)
-
-Write-Host "done!"
-Write-Host "New version available at $($NewFileName)"
