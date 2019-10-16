@@ -275,9 +275,7 @@ Try {
             }
 
             'Score' {
-                $ColumnLetter = [string]$(ExcelSeq($Column))
-                $null = $WS.Range($UsedArea).Sort($WS.Range($($ColumnLetter + 3)), 2, 
-                    $WS.Range($($ColumnLetter + $RowCount)), $null, 1, $null, 2, 2)
+                #Set column format as number
                 $WS.Cells.EntireColumn.Item($Column).NumberFormat = "0.0"
                 $WS.Cells.EntireColumn.Item($Column).ColumnWidth = 16
 
@@ -285,6 +283,17 @@ Try {
                     $CurValue = [string]$WS.Cells.Item($Row, $Column).Value2
                     $WS.Cells.Item($Row, $Column).Value2 = $CurValue
                 }
+
+                #Sort column descending
+                $ColumnLetter = [string]$(ExcelSeq($Column))
+                $null = $WS.Range($UsedArea).Sort($WS.Range($($ColumnLetter + 3)),
+                    [Microsoft.Office.Interop.Excel.XlSortOrder]::xlDescending,
+                    $WS.Range($($ColumnLetter + $RowCount)),
+                    $null,
+                    [Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlNo,
+                    $null,
+                    [Microsoft.Office.Interop.Excel.XlSortDataOption]::xlSortTextAsNumbers,
+                    [Microsoft.Office.Interop.Excel.XlSortDataOption]::xlSortTextAsNumbers)                
 
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
@@ -427,7 +436,8 @@ Try {
 
         $LastSheet = $WB.Worksheets | Select-Object -Last 1
         $LastSheet.Move($WSPT)
-    } Else {
+    }
+    Else {
         Write-Host "`r`nWarning! Make sure this report is not already formatted and there is only one worksheet.`r`nSkipping pivot tables worksheets."
     }
 
@@ -460,9 +470,9 @@ Catch {
     Write-Host $Error[0].Exception.Message
 
     #Make sure COM variables are released, so excel.exe is gone.
-    If ($WS) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WS)}
-    If ($WB) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WB)}
-    If ($XL) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($XL)}
+    If ($WS) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WS) }
+    If ($WB) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WB) }
+    If ($XL) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($XL) }
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
 }
