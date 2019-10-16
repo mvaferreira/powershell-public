@@ -293,7 +293,7 @@ Try {
                     [Microsoft.Office.Interop.Excel.XlYesNoGuess]::xlNo,
                     $null,
                     [Microsoft.Office.Interop.Excel.XlSortDataOption]::xlSortTextAsNumbers,
-                    [Microsoft.Office.Interop.Excel.XlSortDataOption]::xlSortTextAsNumbers)                
+                    [Microsoft.Office.Interop.Excel.XlSortDataOption]::xlSortTextAsNumbers)              
 
                 $WS.Cells.EntireColumn.Item($Column).HorizontalAlignment = -4108
                 $WS.Cells.EntireColumn.Item($Column).VerticalAlignment = -4160
@@ -403,7 +403,7 @@ Try {
         $pivotTableName = "EffortPivotTable"
         $RowFields = @("Effort", "Focus Area", "Content and Best Practices")
         $DataField = "Score"
-        $DataFieldText = [string]"Count of " + $DataField
+        $DataFieldText = [string]"Count of Effort"
         $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlCount
         CreatePivotTable $WSName $DataTableName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
         #EndRegion 'Recommendations by Effort'
@@ -416,8 +416,8 @@ Try {
         $pivotTableName = "ImpactPivotTable"
         $RowFields = @("Impact", "Recommendation Title", "Content and Best Practices")
         $DataField = "Score"
-        $DataFieldText = [string]"Sum of " + $DataField
-        $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlSum
+        $DataFieldText = [string]"Count of Impact"
+        $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlCount
         CreatePivotTable $WSName $DataTableName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
         #EndRegion 'Recommendations by Impact'
 
@@ -429,7 +429,7 @@ Try {
         $pivotTableName = "FocusAreaPivotTable"
         $RowFields = @("Focus Area", "Recommendation Title", "Content and Best Practices", "Affected Objects")
         $DataField = "Score"
-        $DataFieldText = [string]"Count of " + $DataField
+        $DataFieldText = [string]"Count of Focus Area"
         $DataFieldSummary = [Microsoft.Office.Interop.Excel.XlConsolidationFunction]::xlCount
         CreatePivotTable $WSName $DataTableName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
         #EndRegion 'Recommendations by Focus Area'
