@@ -197,17 +197,12 @@ Try {
         $WSs = $WB.Worksheets
 
         ForEach($WS In $WSs) {
-            If ($WS.Name -match "PlanWorkSheet") {
+            $WS.Visible = $True
+            If ($WS.Name -match "PlanWorkSheet" -Or $WS.Name -match "Survey Q&A") {
                 If([string]$WS.Cells.EntireRow.Item(3).Value2 -notmatch '[a-z]') {
                     $WS.Delete()
                 }
             }
-
-            If ($WS.Name -match "Survey Q&A") {
-                If([string]$WS.Cells.EntireRow.Item(3).Value2 -notmatch '[a-z]') {
-                    $WS.Delete()
-                }
-            }            
         }
     }
 
@@ -237,6 +232,10 @@ Try {
             $WB.ActiveSheet.ListObjects($DataTableName).Unlist()
         }
     }
+
+    #Move Assessment worksheet to first
+    $WSDataSheet = $WB.Worksheets | Where-Object {$_.Name -eq $DataSheetName }
+    If($WB.ActiveSheet.Name -ne $WSDataSheet.Name) { $WSDataSheet.Move($WB.Worksheets[$DataSheetName]) }
 
     #Apply table style to used area
     $ListObject = $WB.ActiveSheet.ListObjects.Add([Microsoft.Office.Interop.Excel.XlListObjectSourceType]::xlSrcRange,
@@ -418,7 +417,7 @@ Try {
     }
 
     #Add PivotTables, if only found the Assessment worksheet
-    If ($WB.Worksheets.Count -eq 1) {
+    If ($WB.Worksheets.Count -le 2) {
         #region 'Recommendations by Effort'
         $WSName = "Recommendations by Effort"
         $WSPT = $WB.Worksheets.Add()
@@ -458,10 +457,11 @@ Try {
         CreatePivotTable $WSName $DataTableName $pivotTableName $WSPT $RowFields $DataField $DataFieldSummary $DataFieldText
         #EndRegion 'Recommendations by Focus Area'
 
-        $LastSheet = $WB.Worksheets | Select-Object -Last 1
-        $LastSheet.Move($WSPT)
-    }
-    Else {
+        #Move Assessment worksheet to first
+        $FirstSheet = $WB.Worksheets | Select-Object -First 1
+        $DataSheet = $WB.Worksheets | Where-Object {$_.Name -eq $DataSheetName}
+        $DataSheet.Move($FirstSheet)
+    } Else {
         Write-Host "`r`nWarning! Make sure this report is not already formatted and there is only one worksheet.`r`nSkipping pivot tables worksheets."
     }
 
@@ -491,7 +491,7 @@ Try {
 }
 Catch {
     Write-Host "`r`n"
-    Write-Host $Error[0].Exception.Message
+    Write-Host "[$(Get-Date)] $($Error[0].Exception.Message)`r`n$($Error[0].Exception)"
 
     #Make sure COM variables are released, so excel.exe is gone.
     If ($WS) { [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($WS) }
