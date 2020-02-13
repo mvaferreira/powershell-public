@@ -14,7 +14,7 @@
     
     .SYNOPSIS
     Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-    Version: 0.2
+    Version: 0.3
 
     .DESCRIPTION
     This script will nicely format the OnDemandAssessment (ODA) excel report.
@@ -35,6 +35,8 @@ If ($Report -And ($Report.Length -gt 1)) {
     If (-Not (Test-Path -Path $Report)) {
         Write-Host "File $($Report) not found."
         return
+    } Else {
+        $Report = (Get-Item -Path $Report).FullName
     }
 }
 Else {
@@ -185,9 +187,32 @@ Try {
     $XL = New-Object -ComObject Excel.Application
     $ExcelPID = Get-Process excel -ErrorAction Ignore | ForEach-Object { $_.Id } | Where-Object { $AllPIDs -notcontains $_ }
 
+    #Open Excel file
     $XL.Visible = $False
+    $XL.DisplayAlerts = $False
     $WB = $XL.Workbooks.Open($Report)
+
+    #Delete empty worksheets
+    If ($WB.Worksheets.Count -gt 1) {
+        $WSs = $WB.Worksheets
+
+        ForEach($WS In $WSs) {
+            If ($WS.Name -match "PlanWorkSheet") {
+                If([string]$WS.Cells.EntireRow.Item(3).Value2 -notmatch '[a-z]') {
+                    $WS.Delete()
+                }
+            }
+
+            If ($WS.Name -match "Survey Q&A") {
+                If([string]$WS.Cells.EntireRow.Item(3).Value2 -notmatch '[a-z]') {
+                    $WS.Delete()
+                }
+            }            
+        }
+    }
+
     $DataSheetName = "AssessmentWorkSheet"
+    $WB.Worksheets($DataSheetName).Activate | Out-Null
     $WS = $WB.Worksheets.Item($DataSheetName)
 
     #Get used row and column count
@@ -393,8 +418,7 @@ Try {
     }
 
     #Add PivotTables, if only found the Assessment worksheet
-
-    If ($WB.Worksheets.Count -eq 2) {
+    If ($WB.Worksheets.Count -eq 1) {
         #region 'Recommendations by Effort'
         $WSName = "Recommendations by Effort"
         $WSPT = $WB.Worksheets.Add()
@@ -463,7 +487,7 @@ Try {
     [GC]::WaitForPendingFinalizers()
 
     Write-Host "done!"
-    Write-Host "New version available at $($NewFileName)"
+    Write-Host "New version available at $($NewFileName)"  
 }
 Catch {
     Write-Host "`r`n"
