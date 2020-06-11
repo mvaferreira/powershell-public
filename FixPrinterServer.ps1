@@ -86,7 +86,7 @@ If ($Modify) {
 }
 
 #Clear spooler directory
-$SpoolDirectory = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers").DefaultSpoolDirectory
+$SpoolDirectory = (Get-ItemProperty "$($PrintRoot)\Printers").DefaultSpoolDirectory
 Write-Host "[$(Get-Date)] Cleaning Spooler directory $($SpoolDirectory)..."
 If ($Modify) { Get-ChildItem -Path $SpoolDirectory -Recurse | Remove-Item -Recurse -Confirm:$False -Force -ErrorAction SilentlyContinue }
 
