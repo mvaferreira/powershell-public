@@ -31,7 +31,7 @@
 
 $WinGAFolder = "C:\WindowsAzure"
 $Services = "RdAgent", "WindowsAzureGuestAgent", "WindowsAzureTelemetryService"
-$Processes = "WindowsAzureGuestAgent.exe", "WaAppAgent.exe"
+$Processes = "WindowsAzureGuestAgent.exe", "WaAppAgent.exe", "WindowsAzureTelemetryService.exe"
 $WinGAURL = "https://go.microsoft.com/fwlink/?linkid=394789&clcid=0x409"
 $WinGAMSI = "WindowsAzureVmAgent-new.msi"
 
