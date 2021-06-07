@@ -1,3 +1,34 @@
+<#
+    Disclaimer
+
+    The sample scripts are not supported under any Microsoft standard support program or service.
+    The sample scripts are provided AS IS without warranty of any kind.
+    Microsoft further disclaims all implied warranties including, without limitation, any implied warranties of merchantability
+    or of fitness for a particular purpose.
+    The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+    In no event shall Microsoft, its authors, or anyone else involved in the creation, production,
+    or delivery of the scripts be liable for any damages whatsoever (including, without limitation,
+    damages for loss of business profits, business interruption, loss of business information, or other pecuniary loss)
+    arising out of the use of or inability to use the sample scripts or documentation,
+    even if Microsoft has been advised of the possibility of such damages.
+    
+    .SYNOPSIS
+    Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
+    Version: 0.1
+
+    .DESCRIPTION
+    This script will attempt to remove existing Windows Azure Guest Agent and upgrade it
+    to the latest available from: https://go.microsoft.com/fwlink/?linkid=394789&clcid=0x409
+
+    Please follow this document for manual steps:
+    https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows-azure-guest-agent#step-2-check-whether-auto-update-is-working
+    
+    .EXAMPLE
+    .\UpdateWinGA.ps1
+
+    Check result in C:\WindowsAzure\WinGAInstall.log
+#>
+
 $WinGAFolder = "C:\WindowsAzure"
 $Services = "RdAgent", "WindowsAzureGuestAgent", "WindowsAzureTelemetryService"
 $Processes = "WindowsAzureGuestAgent.exe", "WaAppAgent.exe"
@@ -26,11 +57,11 @@ If (-Not (Test-Path -Path "$($WinGAFolder)\OLD")) {
     New-Item -ItemType Directory -Name "OLD" -Path $WinGAFolder
 }
 
-Get-ChildItem -Directory -Filter "*GuestAgent*" -Path $WinGAFolder | ForEach {
+Get-ChildItem -Directory -Filter "*GuestAgent*" -Path $WinGAFolder | ForEach-Object {
     Move-Item -Path $_.FullName -Destination "$($WinGAFolder)\OLD" -Force
 }
 
-Get-ChildItem -Directory -Filter "Packages*" -Path $WinGAFolder | ForEach {
+Get-ChildItem -Directory -Filter "Packages*" -Path $WinGAFolder | ForEach-Object {
     Move-Item -Path $_.FullName -Destination "$($WinGAFolder)\OLD" -Force
 }
 
@@ -62,5 +93,7 @@ If (Test-Path -Path "$($WinGAFolder)\$WinGAMSI") {
         $ReturnMSG = $Process.StandardOutput.ReadToEnd()
         $ReturnMSG
     }
-    Catch { }
+    Catch { 
+        Write-Host $Error[0].Exception.Message
+    }
 }
