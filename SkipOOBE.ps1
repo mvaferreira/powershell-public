@@ -16,7 +16,17 @@ $unattendXmlContent = @"
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <HideLocalAccountScreen>true</HideLocalAccountScreen>
         <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <HidePrivacySettings>true</HidePrivacySettings>
       </OOBE>
+      <FirstLogonCommands>
+        <SynchronousCommand>
+          <CommandLine>cmd /c "reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v SkipPrivacySettings /t REG_DWORD /d 1 /f"</CommandLine>
+          <Order>1</Order>
+        </SynchronousCommand>
+      </FirstLogonCommands>
     </component>
   </settings>
 </unattend>
