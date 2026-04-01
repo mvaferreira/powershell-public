@@ -15,7 +15,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.2.1
+        Version: 0.3.0
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -112,8 +112,8 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$IncludeServices,
     [Parameter(ParameterSetName = 'Repair')][switch]$IssuesOnly,
     [Parameter(ParameterSetName = 'Repair')][string[]]$DisableDriverOrService = @(),
-    [Parameter(ParameterSetName = 'Repair')][string[]]$EnableDriverOrService  = @(),
-    [Parameter(ParameterSetName = 'Repair')][ValidateSet('Boot','System','Automatic','Manual','Disabled')][string]$DriverStartType = 'Manual',
+    [Parameter(ParameterSetName = 'Repair')][string[]]$EnableDriverOrService = @(),
+    [Parameter(ParameterSetName = 'Repair')][ValidateSet('Boot', 'System', 'Automatic', 'Manual', 'Disabled')][string]$DriverStartType = 'Manual',
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableCredentialGuard,
     [Parameter(ParameterSetName = 'Repair')][switch]$EnableCredentialGuard,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableAppLocker,
@@ -132,6 +132,16 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$CheckDiskHealth,
     [Parameter(ParameterSetName = 'Repair')][switch]$CollectEventLogs,
     [Parameter(ParameterSetName = 'Repair')][switch]$CollectMinidumps,
+    [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeCriticalBootFiles,
+    [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeSyntheticDrivers,
+    [Parameter(ParameterSetName = 'Repair')][switch]$EnsureSyntheticDriversEnabled,
+    [Parameter(ParameterSetName = 'Repair')][switch]$ResetInterfacesToDHCP,
+    [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeProxyState,
+    [Parameter(ParameterSetName = 'Repair')][switch]$ClearProxyState,
+    [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeBcdConsistency,
+    [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeServicingState,
+    [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeDomainTrustState,
+    [Parameter(ParameterSetName = 'Repair')][switch]$PrepareRecoveryDiagnostics,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableDriverVerifier,
     [Parameter(ParameterSetName = 'Repair')][string]$EnableDriverVerifier = '',
     [Parameter(ParameterSetName = 'Repair')][switch]$ResetGroupPolicy,
@@ -144,8 +154,8 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableStartupPrograms,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableFirewall,
     [Parameter(ParameterSetName = 'Repair')][switch]$LeaveDiskOnline,
-    [Parameter(ParameterSetName = 'Repair')][ValidateSet('SYSTEM','SOFTWARE','COMPONENTS','SAM','SECURITY')][string[]]$LoadHive  = @(),
-    [Parameter(ParameterSetName = 'Repair')][ValidateSet('SYSTEM','SOFTWARE','COMPONENTS','SAM','SECURITY')][string[]]$UnloadHive = @(),
+    [Parameter(ParameterSetName = 'Repair')][ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$LoadHive = @(),
+    [Parameter(ParameterSetName = 'Repair')][ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$UnloadHive = @(),
     [Parameter(ParameterSetName = 'ShowSession')][switch]$ShowLastSession,
     [Parameter(ParameterSetName = 'ShowSession')][switch]$Detailed,
     [Parameter(ParameterSetName = 'ShowSession')][switch]$All,
@@ -223,13 +233,15 @@ function Invoke-BcdEdit {
 # Path to the action log (JSON line entries)
 if (-not $env:RepairActionLog) {
     $script:ActionLogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) 'Repair-AzVMDisk_actions.log'
-} else {
+}
+else {
     # Validate that the env override is a simple file path (no UNC, no alternate data streams)
     $envPath = $env:RepairActionLog
     if ($envPath -match '^\\\\' -or $envPath -match ':.*:') {
         Write-Warning "RepairActionLog path '$envPath' looks unsafe; using default log location."
         $script:ActionLogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) 'Repair-AzVMDisk_actions.log'
-    } else {
+    }
+    else {
         $script:ActionLogPath = $envPath
     }
 }
@@ -242,12 +254,13 @@ try {
     $acl = Get-Acl -LiteralPath $script:ActionLogPath
     $acl.SetAccessRuleProtection($true, $false)   # disable inheritance, remove inherited entries
     $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
-    $adminRule  = [System.Security.AccessControl.FileSystemAccessRule]::new('BUILTIN\Administrators', 'FullControl', 'Allow')
-    $systemRule = [System.Security.AccessControl.FileSystemAccessRule]::new('NT AUTHORITY\SYSTEM',    'FullControl', 'Allow')
+    $adminRule = [System.Security.AccessControl.FileSystemAccessRule]::new('BUILTIN\Administrators', 'FullControl', 'Allow')
+    $systemRule = [System.Security.AccessControl.FileSystemAccessRule]::new('NT AUTHORITY\SYSTEM', 'FullControl', 'Allow')
     $acl.AddAccessRule($adminRule)
     $acl.AddAccessRule($systemRule)
     Set-Acl -LiteralPath $script:ActionLogPath -AclObject $acl
-} catch {
+}
+catch {
     Write-Warning "Could not restrict log file permissions: $_"
 }
 
@@ -329,11 +342,13 @@ function Get-LastRepairSession {
         # When -All and -ExportTo are combined, export all entries; otherwise print them
         if ($ExportTo) {
             # fall through: $entries already contains everything, export block below handles it
-        } else {
+        }
+        else {
             $entries | Format-List
             return
         }
-    } elseif ($SessionId) {
+    }
+    elseif ($SessionId) {
         $entries = $entries | Where-Object { $_.SessionId -eq $SessionId }
     }
     else {
@@ -352,13 +367,13 @@ function Get-LastRepairSession {
         foreach ($e in $entries) {
             $entryTime = $e.Time
             $entryType = $e.Event
-            $guest     = if ($e.GuestName) { $e.GuestName } else { '' }
-            $diskNum   = if ($null -ne $e.DiskNumber -and $e.DiskNumber -ne '') { "Disk$($e.DiskNumber)" } else { '' }
-            $target    = (@($guest, $diskNum) | Where-Object { $_ }) -join '/'
+            $guest = if ($e.GuestName) { $e.GuestName } else { '' }
+            $diskNum = if ($null -ne $e.DiskNumber -and $e.DiskNumber -ne '') { "Disk$($e.DiskNumber)" } else { '' }
+            $target = (@($guest, $diskNum) | Where-Object { $_ }) -join '/'
             $targetCol = if ($target) { "[$target]  " } else { '' }
-            $success   = if ($null -ne $e.Details.Success) { if ($e.Details.Success) { '[OK]' } else { '[FAIL]' } } else { '' }
-            $desc      = if ($e.Details.Description) { $e.Details.Description } elseif ($e.Message) { $e.Message } else { '' }
-            $color     = if ($e.Details.Success -eq $false) { 'Red' } elseif ($entryType -eq 'SessionStart') { 'Cyan' } else { 'White' }
+            $success = if ($null -ne $e.Details.Success) { if ($e.Details.Success) { '[OK]' } else { '[FAIL]' } } else { '' }
+            $desc = if ($e.Details.Description) { $e.Details.Description } elseif ($e.Message) { $e.Message } else { '' }
+            $color = if ($e.Details.Success -eq $false) { 'Red' } elseif ($entryType -eq 'SessionStart') { 'Cyan' } else { 'White' }
             Write-Host "$entryTime  $targetCol$entryType  $success  $desc" -ForegroundColor $color
             if ($e.Details.Error) { Write-Host "  ERROR: $($e.Details.Error)" -ForegroundColor Red }
 
@@ -395,7 +410,8 @@ function Get-LastRepairSession {
                 }
                 $detailFields = if ($e.Details.Details) {
                     ($e.Details.Details.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '; '
-                } else { '' }
+                }
+                else { '' }
                 [PSCustomObject]@{
                     Time        = $e.Time
                     GuestName   = if ($e.GuestName) { $e.GuestName } else { '' }
@@ -412,34 +428,35 @@ function Get-LastRepairSession {
             $rows | Export-Csv -Path $ExportTo -NoTypeInformation -Encoding UTF8
             Write-Host "Session exported to CSV: $ExportTo" -ForegroundColor Green
 
-        } elseif ($ext -eq '.html') {
+        }
+        elseif ($ext -eq '.html') {
             $htmlRows = foreach ($e in $entries) {
                 $entryType = $e.Event
-                $success   = if ($null -ne $e.Details.Success) { if ($e.Details.Success) { '<span style="color:green">[OK]</span>' } else { '<span style="color:red">[FAIL]</span>' } } else { '' }
-                $desc      = [System.Web.HttpUtility]::HtmlEncode($(if ($e.Details.Description) { $e.Details.Description } elseif ($e.Message) { $e.Message } else { '' }))
-                $rowStyle  = if ($e.Details.Success -eq $false) { 'background:#ffe0e0' } elseif ($entryType -eq 'SessionStart') { 'background:#e0f0ff' } else { '' }
-                $duration  = ''
+                $success = if ($null -ne $e.Details.Success) { if ($e.Details.Success) { '<span style="color:green">[OK]</span>' } else { '<span style="color:red">[FAIL]</span>' } } else { '' }
+                $desc = [System.Web.HttpUtility]::HtmlEncode($(if ($e.Details.Description) { $e.Details.Description } elseif ($e.Message) { $e.Message } else { '' }))
+                $rowStyle = if ($e.Details.Success -eq $false) { 'background:#ffe0e0' } elseif ($entryType -eq 'SessionStart') { 'background:#e0f0ff' } else { '' }
+                $duration = ''
                 if ($e.Details.Start -and $e.Details.End) {
                     $duration = '{0:N3}s' -f ([datetime]$e.Details.End - [datetime]$e.Details.Start).TotalSeconds
                 }
                 $detailHtml = ''
                 if ($e.Details.Details) {
                     $detailHtml = '<ul style="margin:2px 0;padding-left:16px;font-size:0.85em;color:#555">' +
-                        (($e.Details.Details.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object {
+                    (($e.Details.Details.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Value -ne '' } | ForEach-Object {
                             "<li><b>$([System.Web.HttpUtility]::HtmlEncode($_.Name)):</b> $([System.Web.HttpUtility]::HtmlEncode([string]$_.Value))</li>"
                         }) -join '') + '</ul>'
                 }
                 $outputHtml = ''
                 if ($e.Details.Output -and ([string]$e.Details.Output).Trim()) {
                     $outputHtml = '<pre style="margin:2px 0;font-size:0.8em;background:#f5f5f5;padding:4px;white-space:pre-wrap">' +
-                        [System.Web.HttpUtility]::HtmlEncode(([string]$e.Details.Output).Trim()) + '</pre>'
+                    [System.Web.HttpUtility]::HtmlEncode(([string]$e.Details.Output).Trim()) + '</pre>'
                 }
                 $errorHtml = ''
                 if ($e.Details.Error) {
                     $errorHtml = '<div style="color:red;font-size:0.85em">ERROR: ' + [System.Web.HttpUtility]::HtmlEncode($e.Details.Error) + '</div>'
                 }
                 $guestHtml = [System.Web.HttpUtility]::HtmlEncode($(if ($e.GuestName) { $e.GuestName } else { '' }))
-                $diskHtml  = if ($null -ne $e.DiskNumber -and $e.DiskNumber -ne '') { $e.DiskNumber } else { '' }
+                $diskHtml = if ($null -ne $e.DiskNumber -and $e.DiskNumber -ne '') { $e.DiskNumber } else { '' }
                 "<tr style='$rowStyle'><td style='white-space:nowrap'>$($e.Time)</td><td>$guestHtml</td><td>$diskHtml</td><td>$entryType</td><td>$success</td><td>$desc</td><td>$duration</td><td>$detailHtml$errorHtml$outputHtml</td></tr>"
             }
             $sessionLabel = if ($All) { 'AllSessions' } elseif ($SessionId) { $SessionId } else { ($entries | Where-Object { $_.Event -eq 'SessionStart' } | Select-Object -First 1).SessionId }
@@ -466,7 +483,8 @@ $($htmlRows -join "`n")
             $html | Out-File -FilePath $ExportTo -Encoding UTF8
             Write-Host "Session exported to HTML: $ExportTo" -ForegroundColor Green
 
-        } else {
+        }
+        else {
             Write-Warning "Unknown export format '$ext'. Use .html or .csv"
         }
     }
@@ -524,7 +542,7 @@ function New-Item-Logged {
     )
     $logValue = if ($RedactValue) { '***REDACTED***' } else { $Value }
     $displayParts = @("'$Path'")
-    if ($Name)     { $displayParts += "-Name '$Name'" }
+    if ($Name) { $displayParts += "-Name '$Name'" }
     if ($ItemType) { $displayParts += "-ItemType '$ItemType'" }
     if ($null -ne $logValue -and $logValue -ne '') { $displayParts += "-Value '$logValue'" }
     Write-Host "  [exec] New-Item $($displayParts -join ' ')" -ForegroundColor DarkGray
@@ -597,9 +615,11 @@ function Get-PartitionRole {
     $isEfiPartition = $PartitionInfo.Type -eq 'System'
     if ($isEfiPartition -and (Test-Path $efiPathBcd)) {
         $role += "Boot (UEFI)"
-    } elseif ($isEfiPartition -and (Test-Path $efiPathDir)) {
+    }
+    elseif ($isEfiPartition -and (Test-Path $efiPathDir)) {
         $role += "Boot (UEFI - BCD missing)"
-    } elseif ($isEfiPartition) {
+    }
+    elseif ($isEfiPartition) {
         $role += "Boot (UEFI - EFI folder missing)"
     }
     
@@ -609,9 +629,11 @@ function Get-PartitionRole {
     $isActivePartition = $PartitionInfo.IsActive
     if ($isActivePartition -and (Test-Path $biosPathBcd)) {
         $role += "Boot (BIOS)"
-    } elseif ($isActivePartition -and (Test-Path $biosPathDir)) {
+    }
+    elseif ($isActivePartition -and (Test-Path $biosPathDir)) {
         $role += "Boot (BIOS - BCD missing)"
-    } elseif ($isActivePartition) {
+    }
+    elseif ($isActivePartition) {
         $role += "Boot (BIOS - Boot folder missing)"
     }
     
@@ -704,14 +726,15 @@ function MountOffHive {
         if ($out -match 'being used by another process|locked') {
             # The hive file is already loaded under a different key name.
             # Scan HKLM for non-standard keys to help the user identify it.
-            $stdKeys = @('BCD00000000','HARDWARE','SAM','SECURITY','SOFTWARE','SYSTEM',
-                         'BROKENSYSTEM','BROKENSOFTWARE','BROKENCOMPONENTS','BROKENSAM','BROKENSECURITY')
+            $stdKeys = @('BCD00000000', 'HARDWARE', 'SAM', 'SECURITY', 'SOFTWARE', 'SYSTEM',
+                'BROKENSYSTEM', 'BROKENSOFTWARE', 'BROKENCOMPONENTS', 'BROKENSAM', 'BROKENSECURITY')
             $foreign = reg.exe query HKLM 2>&1 | ForEach-Object {
                 if ($_ -match '^HKEY_LOCAL_MACHINE\\(.+)$') { $Matches[1] }
             } | Where-Object { $_ -notin $stdKeys }
             $hint = if ($foreign) {
                 "Found non-standard HKLM keys that may be the loaded hive: $($foreign -join ', '). Unload them first (reg unload HKLM\<keyname>)."
-            } else {
+            }
+            else {
                 "Check if the hive file is loaded under a different key name (reg query HKLM) and unload it first."
             }
             throw "Cannot load $Hive hive - the file is already in use by another process. $hint"
@@ -760,16 +783,68 @@ function UnmountOffHive {
     Write-Warning "Failed to unload $hiveKey after $maxAttempts attempts: $($out.Trim()). The hive may still be loaded; use -UnloadHive $Hive before retrying."
 }
 
+function Invoke-WithHive {
+    # Mounts one or more offline registry hives, executes the given script block,
+    # and guarantees the hives are unmounted in the finally block (reverse order).
+    # Usage:  Invoke-WithHive 'SYSTEM' { <body> }
+    #         Invoke-WithHive 'SYSTEM','SOFTWARE' { <body> }
+    param(
+        [Parameter(Mandatory)][string[]]$Hive,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock
+    )
+    $wp = Join-Path $script:WinDriveLetter "Windows"
+    foreach ($h in $Hive) { MountOffHive -WinPath $wp -Hive $h }
+    try {
+        . $ScriptBlock
+    }
+    finally {
+        for ($i = $Hive.Count - 1; $i -ge 0; $i--) { UnmountOffHive -Hive $Hive[$i] }
+    }
+}
+
+# Resolves an offline guest ImagePath (\SystemRoot\, %SystemRoot%, system32\, C:\, etc.)
+# to a local path on the attached drive letter. Strips the trailing extension match too.
+function Resolve-GuestImagePath {
+    param([string]$ImagePath)
+    $drive = $script:WinDriveLetter.TrimEnd('\')
+    $resolved = $ImagePath `
+        -replace '(?i)\\SystemRoot\\', "$drive\Windows\" `
+        -replace '(?i)%SystemRoot%', "$drive\Windows" `
+        -replace '(?i)\\\?\?\\', '' `
+        -replace '(?i)^system32\\', "$drive\Windows\System32\" `
+        -replace '(?i)^"?[A-Z]:\\', "$drive\"
+    if ($resolved -match '^(.+?\.(?:sys|exe|dll))') { $resolved = $Matches[1] }
+    return $resolved
+}
+
+# Validate user-supplied service/driver names before using them in registry paths.
+# Allowed characters: letters, digits, underscore, dot, hyphen.
+function Assert-ValidServiceOrDriverName {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$ParameterName = 'ServiceName'
+    )
+
+    $trimmed = $Name.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        throw "Invalid ${ParameterName}: value cannot be empty."
+    }
+    if ($trimmed.Length -gt 128 -or $trimmed -notmatch '^[A-Za-z0-9_.-]+$') {
+        throw "Invalid $ParameterName '$Name'. Allowed characters: A-Z, a-z, 0-9, underscore (_), dot (.), hyphen (-)."
+    }
+    return $trimmed
+}
+
 # Helper: Disable service or driver
 function Disable-ServiceOrDriver {
     param(
-        [Parameter(Mandatory = $true)]$ServiceName
+        [Parameter(Mandatory = $true)][string]$ServiceName
     )
 
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
-        $SystemRoot      = Get-SystemRootPath
+    $ServiceName = Assert-ValidServiceOrDriverName -Name $ServiceName -ParameterName 'DisableDriverOrService'
+
+    Invoke-WithHive 'SYSTEM' {
+        $SystemRoot = Get-SystemRootPath
         $ServiceFullPath = "$SystemRoot\Services\$ServiceName"
 
         if (Test-Path $ServiceFullPath) {
@@ -786,21 +861,21 @@ function Disable-ServiceOrDriver {
         # On next boot the class manager will attempt to load it, fail, and likely cause:
         #   - stop error 0x7B (INACCESSIBLE_BOOT_DEVICE) for disk/SCSI/volume classes
         #   - complete loss of network connectivity for the Net class
-        $csName      = ($SystemRoot -replace '^HKLM:\\BROKENSYSTEM\\', '') -replace '\\.*', ''
-        $classRoot   = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
+        $csName = ($SystemRoot -replace '^HKLM:\\BROKENSYSTEM\\', '') -replace '\\.*', ''
+        $classRoot = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
         $critClasses = @(
-            @{ GUID = '{4d36e967-e325-11ce-bfc1-08002be10318}'; Name = 'DiskDrive'      }
-            @{ GUID = '{4d36e96a-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIAdapter'    }
+            @{ GUID = '{4d36e967-e325-11ce-bfc1-08002be10318}'; Name = 'DiskDrive' }
+            @{ GUID = '{4d36e96a-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIAdapter' }
             @{ GUID = '{4d36e97b-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIController' }
-            @{ GUID = '{71a27cdd-812a-11d0-bec7-08002be2092f}'; Name = 'Volume'         }
-            @{ GUID = '{4d36e972-e325-11ce-bfc1-08002be10318}'; Name = 'Net'            }
+            @{ GUID = '{71a27cdd-812a-11d0-bec7-08002be2092f}'; Name = 'Volume' }
+            @{ GUID = '{4d36e972-e325-11ce-bfc1-08002be10318}'; Name = 'Net' }
         )
         $filterHits = [System.Collections.Generic.List[string]]::new()
         foreach ($cls in $critClasses) {
             $cp = "$classRoot\$($cls.GUID)"
             if (-not (Test-Path $cp)) { continue }
             foreach ($ft in @('UpperFilters', 'LowerFilters')) {
-                $raw     = (Get-ItemProperty $cp -ErrorAction SilentlyContinue).$ft
+                $raw = (Get-ItemProperty $cp -ErrorAction SilentlyContinue).$ft
                 $entries = @($raw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
                 if ($entries -icontains $ServiceName) {
                     $filterHits.Add("$($cls.Name) $ft")
@@ -826,33 +901,27 @@ function Disable-ServiceOrDriver {
             Write-Warning "     registry value in the listed class key(s) before booting the VM."
         }
     }
-    catch {
-        Write-Error "Disable-ServiceOrDriver failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 # Helper: Enable service or driver
 function Enable-ServiceOrDriver {
     param(
-        [Parameter(Mandatory = $true)]$ServiceName,
+        [Parameter(Mandatory = $true)][string]$ServiceName,
         [Parameter(Mandatory = $true)]$StartValue
     )
 
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
-        $SystemRoot      = Get-SystemRootPath
+    $ServiceName = Assert-ValidServiceOrDriverName -Name $ServiceName -ParameterName 'EnableDriverOrService'
+
+    Invoke-WithHive 'SYSTEM' {
+        $SystemRoot = Get-SystemRootPath
         $ServiceFullPath = "$SystemRoot\Services\$ServiceName"
 
         if (Test-Path $ServiceFullPath) {
             $CurrentValue = (Get-ItemProperty -Path $ServiceFullPath -Name Start -ErrorAction SilentlyContinue).Start
             if ($null -ne $CurrentValue -and [int]$CurrentValue -eq [int]$StartValue) {
                 Write-Host "  $ServiceName Start = $CurrentValue (already correct, no change needed)." -ForegroundColor DarkGray
-            } else {
+            }
+            else {
                 Write-Host "  $ServiceName Start: $CurrentValue -> $StartValue" -ForegroundColor Cyan
                 Set-ItemProperty-Logged -Path $ServiceFullPath -Name Start -Value $StartValue -Type DWord -Force
             }
@@ -861,31 +930,15 @@ function Enable-ServiceOrDriver {
             Write-Host "Service path $ServiceFullPath not found." -ForegroundColor Yellow
         }
     }
-    catch {
-        Write-Error "Enable-ServiceOrDriver failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 # Helper: Enable registry periodic backups (regback)
 function EnableRegBackup {
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
 
         Write-Host "Enabling registry backup feature..." #https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/system-registry-no-backed-up-regback-folder
         Set-ItemProperty-Logged -Path "$SystemRoot\Control\Session Manager\Configuration Manager" -Name EnablePeriodicBackup -Value 1 -Type DWord -Force
-    }
-    catch {
-        Write-Error "EnableRegBackup failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -987,50 +1040,32 @@ function RunSFC {
 }
 
 function SetLKGC {
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $CurrentBoot = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
         $LastKnownGood = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name LastKnownGood).LastKnownGood
         Write-Host "Current HKLM: $CurrentBoot`r`nLast Known Good: $LastKnownGood" -ForegroundColor Green
         Write-Host "`r`nSetting next boot to LKGD: $LastKnownGood" -ForegroundColor Yellow
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Select" -Name Current -Value $LastKnownGood -Type DWord -Force
     }
-    catch {
-        Write-Error "SetLKGC failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 function RevertLKGC {
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
+    Invoke-WithHive 'SYSTEM' {
+        & {
+            $CurrentBoot = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
+            Write-Host "Current HKLM: $CurrentBoot" -ForegroundColor Green
 
-    try {
-        $CurrentBoot = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
-        Write-Host "Current HKLM: $CurrentBoot" -ForegroundColor Green
+            $NextSetting = Get-ChildItem 'HKLM:\BROKENSYSTEM' |
+            Where-Object { $_.PSChildName -like 'ControlSet*' } |
+            ForEach-Object {
+                [int]($_.PSChildName -replace 'ControlSet00', '')
+            } |
+            Where-Object { $_ -ne $CurrentBoot } |
+            Select-Object -First 1
 
-        $NextSetting = Get-ChildItem 'HKLM:\BROKENSYSTEM' |
-        Where-Object { $_.PSChildName -like 'ControlSet*' } |
-        ForEach-Object {
-            [int]($_.PSChildName -replace 'ControlSet00', '')
-        } |
-        Where-Object { $_ -ne $CurrentBoot } |
-        Select-Object -First 1
-
-        Write-Host "`r`nSetting boot registry to: $NextSetting" -ForegroundColor Yellow
-        Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Select" -Name Current -Value $NextSetting -Type DWord -Force
-    }
-    catch {
-        Write-Error "RevertLKGC failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
+            Write-Host "`r`nSetting boot registry to: $NextSetting" -ForegroundColor Yellow
+            Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Select" -Name Current -Value $NextSetting -Type DWord -Force
+        }
     }
 }
 
@@ -1072,9 +1107,7 @@ function RemoveSafeMode {
 }
 
 function ConfigureFullMemDump {
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
 
         Write-Host "Configuring full memory dump settings..." -ForegroundColor Yellow
@@ -1092,13 +1125,6 @@ function ConfigureFullMemDump {
             Write-Host "Configuring pagefile to C: drive..." -ForegroundColor Yellow
             Set-ItemProperty-Logged -Path "$SystemRoot\Control\Session Manager\Memory Management" -Name PagingFiles -Value "C:\pagefile.sys 0 0" -Type MultiString -Force
         }
-    }
-    catch {
-        Write-Error "ConfigureFullMemDump failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -1232,9 +1258,7 @@ function AddNewUser2 {
         [Parameter(Mandatory = $True)][pscredential]$Credential
     )
 
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         Write-Host "Configuring setup and adding script..." -ForegroundColor Green
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Setup" -Name SetupType -Value 2 -Type DWord -Force
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Setup" -Name CmdLine -Value "cmd.exe /c c:\temp\adduser.cmd" -Type String -Force
@@ -1261,23 +1285,12 @@ del /F C:\Temp\adduser.cmd > NUL
 
         Write-Host "A script to add the user $Username will run at next boot. If the VM is domain joined, this should work even if local GPO is blocked." -ForegroundColor Green
     }
-    catch {
-        Write-Error "AddNewUser2 failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 
 function GetRdpAuthPolicySnapshot {
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
-        $SystemRoot   = Get-SystemRootPath
+    Invoke-WithHive 'SYSTEM','SOFTWARE' {
+        $SystemRoot = Get-SystemRootPath
         $SoftwareRoot = "HKLM:\BROKENSOFTWARE"
 
         $checks = @(
@@ -1325,39 +1338,26 @@ function GetRdpAuthPolicySnapshot {
             }
         }
     }
-    catch {
-        Write-Error "GetRdpAuthPolicySnapshot failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-        UnmountOffHive -Hive "SOFTWARE"
-    }
 }
 
 function SetRdpAuthPolicyOptimal {
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-
-    try {
-        $SystemRoot   = Get-SystemRootPath
+    Invoke-WithHive 'SYSTEM','SOFTWARE' {
+        $SystemRoot = Get-SystemRootPath
         $SoftwareRoot = "HKLM:\BROKENSOFTWARE"
 
         # --- Define the changes to apply: Path, Name, new Value ---
-        $rdpTcp  = "$SystemRoot\Control\Terminal Server\WinStations\RDP-Tcp"
-        $msv10   = "$SystemRoot\Control\Lsa\MSV1_0"
-        $lsa     = "$SystemRoot\Control\Lsa"
+        $rdpTcp = "$SystemRoot\Control\Terminal Server\WinStations\RDP-Tcp"
+        $msv10 = "$SystemRoot\Control\Lsa\MSV1_0"
+        $lsa = "$SystemRoot\Control\Lsa"
         $credssp = "$SoftwareRoot\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters"
 
         $changes = @(
-            @{ Path = $rdpTcp;  Name = "SecurityLayer";                 Value = 2 },
-            @{ Path = $rdpTcp;  Name = "UserAuthentication";            Value = 0 },
-            @{ Path = $msv10;   Name = "RestrictReceivingNTLMTraffic";  Value = 0 },
-            @{ Path = $msv10;   Name = "RestrictSendingNTLMTraffic";    Value = 0 },
-            @{ Path = $lsa;     Name = "LmCompatibilityLevel";          Value = 3 },
-            @{ Path = $credssp; Name = "AllowEncryptionOracle";         Value = 2 }
+            @{ Path = $rdpTcp; Name = "SecurityLayer"; Value = 2 },
+            @{ Path = $rdpTcp; Name = "UserAuthentication"; Value = 0 },
+            @{ Path = $msv10; Name = "RestrictReceivingNTLMTraffic"; Value = 0 },
+            @{ Path = $msv10; Name = "RestrictSendingNTLMTraffic"; Value = 0 },
+            @{ Path = $lsa; Name = "LmCompatibilityLevel"; Value = 3 },
+            @{ Path = $credssp; Name = "AllowEncryptionOracle"; Value = 2 }
         )
 
         # --- Snapshot current values before making any changes ---
@@ -1367,16 +1367,16 @@ function SetRdpAuthPolicyOptimal {
             if (Test-Path $c.Path) {
                 $prop = Get-ItemProperty -Path $c.Path -Name $c.Name -ErrorAction SilentlyContinue
                 if ($null -ne $prop.($c.Name)) {
-                    $before  = $prop.($c.Name)
+                    $before = $prop.($c.Name)
                     $existed = $true
                 }
             }
             [PSCustomObject]@{
-                Path    = $c.Path
-                Name    = $c.Name
+                Path     = $c.Path
+                Name     = $c.Name
                 NewValue = $c.Value
-                Before  = $before
-                Existed = $existed
+                Before   = $before
+                Existed  = $existed
             }
         }
 
@@ -1398,7 +1398,7 @@ function SetRdpAuthPolicyOptimal {
         foreach ($s in $snapshots) {
             # Convert the BROKEN hive path back to the live registry path for the restore commands
             $livePath = $s.Path -replace '^HKLM:\\BROKENSYSTEM\\', 'HKLM:\SYSTEM\' `
-                                -replace '^HKLM:\\BROKENSOFTWARE\\', 'HKLM:\SOFTWARE\'
+                -replace '^HKLM:\\BROKENSOFTWARE\\', 'HKLM:\SOFTWARE\'
             if ($s.Existed) {
                 Write-Host "Set-ItemProperty -Path '$livePath' -Name '$($s.Name)' -Value $($s.Before) -Type DWord -Force" -ForegroundColor White
             }
@@ -1408,27 +1408,16 @@ function SetRdpAuthPolicyOptimal {
         }
         Write-Host "-------------------------------------------------------------------------------------`n" -ForegroundColor Cyan
     }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-        UnmountOffHive -Hive "SOFTWARE"
-    }
 }
 
 function ResetRDPSettings {
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-
-    $SystemRoot   = Get-SystemRootPath
+    Invoke-WithHive 'SYSTEM','SOFTWARE' {
+    $SystemRoot = Get-SystemRootPath
     $SoftwareRoot = "HKLM:\BROKENSOFTWARE"
-
-    $TSKeyPath    = "$SystemRoot\Control\Terminal Server"
+    $TSKeyPath = "$SystemRoot\Control\Terminal Server"
     $WinStationsPath = "$SystemRoot\Control\Terminal Server\Winstations"
     $RdpTcpPath = "$SystemRoot\Control\Terminal Server\Winstations\RDP-Tcp"
     $TSPolicyPath = "$SoftwareRoot\Policies\Microsoft\Windows NT\Terminal Services"
-
-    try {    
         Write-Host "Setting RDP to default configuration..." -ForegroundColor Yellow
 
         # ── Enable RDP at the canonical registry key ──────────────────────────
@@ -1442,9 +1431,9 @@ function ResetRDPSettings {
         # UmRdpService (Remote Desktop UserMode Port Redirector) - required for redirectors.
         # All three default to Manual (3); set to Auto (2) so they survive reboots reliably.
         $rdpServices = @(
-            @{ Name = 'TermService';   DefaultStart = 2 }
-            @{ Name = 'SessionEnv';    DefaultStart = 2 }
-            @{ Name = 'UmRdpService';  DefaultStart = 2 }
+            @{ Name = 'TermService'; DefaultStart = 2 }
+            @{ Name = 'SessionEnv'; DefaultStart = 2 }
+            @{ Name = 'UmRdpService'; DefaultStart = 2 }
         )
         foreach ($svc in $rdpServices) {
             $svcPath = "$SystemRoot\Services\$($svc.Name)"
@@ -1453,10 +1442,12 @@ function ResetRDPSettings {
                 if ($current -eq 4 -or $null -eq $current) {
                     Write-Host "  $($svc.Name): Start was $(if ($null -eq $current) {'(not set)'} else {'Disabled (4)'}) -> setting to Auto (2)" -ForegroundColor Yellow
                     Set-ItemProperty-Logged -Path $svcPath -Name Start -Value $svc.DefaultStart -Type DWord -Force
-                } else {
+                }
+                else {
                     Write-Host "  $($svc.Name): Start=$current (no change needed)" -ForegroundColor DarkGray
                 }
-            } else {
+            }
+            else {
                 Write-Host "  $($svc.Name): service key not found - skipping" -ForegroundColor DarkGray
             }
         }
@@ -1506,10 +1497,6 @@ function ResetRDPSettings {
             Set-ItemProperty-Logged -Path $tls12Path -Name DisabledByDefault -Value 0 -Type DWord -Force | Out-Null
         }
     }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-        UnmountOffHive -Hive "SOFTWARE"
-    }    
 }
 
 function ResetRDPPrivKeyPermissions {
@@ -1552,10 +1539,7 @@ function ResetRDPPrivKeyPermissions {
 }
 
 function RecreateRDPCertificate {
-    $OfflineWindowsPath = Join-Path $WinDriveLetter "Windows"
-
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
 
         Write-Host "Configuring setup and adding script..." -ForegroundColor Green
@@ -1629,83 +1613,46 @@ Remove-Item -Path C:\temp\rds.pfx -Force
 
         Write-Host "A script to recreate the RDP certificate will run at next boot. If the RDP service fails to restart after that, you may need to restart the VM." -ForegroundColor Green
     }
-    catch {
-        Write-Error "RecreateRDPCertificate failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
-function SetNLADisabled {
-    $OfflineWindowsPath = Join-Path $WinDriveLetter "Windows"
-
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
-        $SystemRoot   = Get-SystemRootPath
+function SetNLA {
+    param([bool]$Enable)
+    Invoke-WithHive 'SYSTEM','SOFTWARE' {
+        $SystemRoot = Get-SystemRootPath
         $SoftwareRoot = "HKLM:\BROKENSOFTWARE"
 
-        $RdpTcpPath   = "$SystemRoot\Control\Terminal Server\Winstations\RDP-Tcp"
+        $RdpTcpPath = "$SystemRoot\Control\Terminal Server\Winstations\RDP-Tcp"
         $TSPolicyPath = "$SoftwareRoot\Policies\Microsoft\Windows NT\Terminal Services"
 
-        Write-Host "Disabling NLA..." -ForegroundColor Green
+        if ($Enable) {
+            Write-Host "Enabling NLA..." -ForegroundColor Green
 
-        Set-ItemProperty-Logged -Path $RdpTcpPath -Name UserAuthentication -Value 0 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $RdpTcpPath -Name SecurityLayer -Value 0 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $RdpTcpPath -Name fAllowSecProtocolNegotiation -Value 0 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $RdpTcpPath -Name MinEncryptionLevel -Value 1 -Type Dword -Force
- 
-        Set-ItemProperty-Logged -Path $TSPolicyPath -Name UserAuthentication -Value 0 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $TSPolicyPath -Name SecurityLayer -Value 0 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $TSPolicyPath -Name fAllowSecProtocolNegotiation -Value 0 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $TSPolicyPath -Name MinEncryptionLevel -Value 1 -Type Dword -Force
-    }
-    catch {
-        Write-Error "SetNLADisabled failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-        UnmountOffHive -Hive "SOFTWARE"
-    }
-}
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name UserAuthentication -Value 1 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name SecurityLayer -Value 2 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name fAllowSecProtocolNegotiation -Value 1 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name MinEncryptionLevel -Value 2 -Type Dword -Force
 
-function SetNLAEnabled {
-    $OfflineWindowsPath = Join-Path $WinDriveLetter "Windows"
-
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
-        $SystemRoot   = Get-SystemRootPath
-        $SoftwareRoot = "HKLM:\BROKENSOFTWARE"
-
-        $RdpTcpPath   = "$SystemRoot\Control\Terminal Server\Winstations\RDP-Tcp"
-        $TSPolicyPath = "$SoftwareRoot\Policies\Microsoft\Windows NT\Terminal Services"
-
-        Write-Host "Enabling NLA..." -ForegroundColor Green
-
-        Set-ItemProperty-Logged -Path $RdpTcpPath -Name UserAuthentication -Value 1 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $RdpTcpPath -Name SecurityLayer -Value 2 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $RdpTcpPath -Name fAllowSecProtocolNegotiation -Value 1 -Type Dword -Force
-        Set-ItemProperty-Logged -Path $RdpTcpPath -Name MinEncryptionLevel -Value 2 -Type Dword -Force
-
-        # Clear any policy overrides that would re-disable NLA after reboot.
-        # These values may not exist (e.g. on a clean VM), so suppress the error.
-        if (Test-Path $TSPolicyPath) {
-            foreach ($val in @('UserAuthentication','SecurityLayer','fAllowSecProtocolNegotiation','MinEncryptionLevel')) {
-                Remove-ItemProperty-Logged -Path $TSPolicyPath -Name $val -Force -ErrorAction SilentlyContinue
+            # Clear any policy overrides that would re-disable NLA after reboot.
+            # These values may not exist (e.g. on a clean VM), so suppress the error.
+            if (Test-Path $TSPolicyPath) {
+                foreach ($val in @('UserAuthentication', 'SecurityLayer', 'fAllowSecProtocolNegotiation', 'MinEncryptionLevel')) {
+                    Remove-ItemProperty-Logged -Path $TSPolicyPath -Name $val -Force -ErrorAction SilentlyContinue
+                }
             }
         }
-    }
-    catch {
-        Write-Error "SetNLAEnabled failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-        UnmountOffHive -Hive "SOFTWARE"
+        else {
+            Write-Host "Disabling NLA..." -ForegroundColor Green
+
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name UserAuthentication -Value 0 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name SecurityLayer -Value 0 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name fAllowSecProtocolNegotiation -Value 0 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $RdpTcpPath -Name MinEncryptionLevel -Value 1 -Type Dword -Force
+ 
+            Set-ItemProperty-Logged -Path $TSPolicyPath -Name UserAuthentication -Value 0 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $TSPolicyPath -Name SecurityLayer -Value 0 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $TSPolicyPath -Name fAllowSecProtocolNegotiation -Value 0 -Type Dword -Force
+            Set-ItemProperty-Logged -Path $TSPolicyPath -Name MinEncryptionLevel -Value 1 -Type Dword -Force
+        }
     }
 }
 
@@ -1790,9 +1737,7 @@ Runs DISM /RevertPendingActions, /StartComponentCleanup, and removes pending pac
     Rename-Item-Logged -Path (Join-Path $WinDriveLetter "Windows\WinSxS\pending.xml") -NewName "pending.old"
 
     Write-Host "Deleting registry keys..." -ForegroundColor Yellow
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "COMPONENTS"
-    try {
+    Invoke-WithHive 'SOFTWARE','COMPONENTS' {
         $ComponentsReg = "HKLM:\BROKENCOMPONENTS"
         $CbsSoftwareReg = "HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
 
@@ -1809,23 +1754,12 @@ Runs DISM /RevertPendingActions, /StartComponentCleanup, and removes pending pac
         Remove-Item-Logged -Path (Join-Path $CbsSoftwareReg "RebootPending") -Recurse -Force
         Remove-Item-Logged -Path (Join-Path $CbsSoftwareReg "SessionsPending") -Recurse -Force
     }
-    catch {
-        Write-Error "ClearPendingUpdates (registry cleanup) failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SOFTWARE"
-        UnmountOffHive -Hive "COMPONENTS"
-    }
 
     Write-Host "You may want to run SFC and Dism /RestoreHealth with script parameters: -RunSFC -FixHealth." -ForegroundColor Green
 }
 
 function SetWinRMHTTPSEnabled {
-    $OfflineWindowsPath = Join-Path $WinDriveLetter "Windows"
-
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
 
         Write-Host "Configuring setup and adding script..." -ForegroundColor Green
@@ -1881,13 +1815,6 @@ Restart-Service -Name WinRM -Force
 
         New-Item-Logged -Path "$WinDriveLetter\Temp" -Name "installwinrmhttps.cmd" -ItemType File -Value $installwinrmhttps.ToString().Trim() -Force
         New-Item-Logged -Path "$WinDriveLetter\Temp" -Name "configwinrmhttps.ps1" -ItemType File -Value $scriptContent.ToString().Trim().Replace("REPLACE_WITH_PASSWORD", $PfxPassword) -Force -RedactValue
-    }
-    catch {
-        Write-Error "SetWinRMHTTPSEnabled failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 
     Write-Host "Now start the VM and wait for the script to configure WinRM over HTTPS. (DO NO CONNECT WITH ENHANCED SESSION)." -ForegroundColor Yellow
@@ -2003,9 +1930,7 @@ function ResetLocalAdminPassword {
     $Username = $Credential.GetNetworkCredential().UserName
     $Password = $Credential.GetNetworkCredential().Password
 
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Setup" -Name SetupType -Value 2 -Type DWord -Force
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Setup" -Name CmdLine -Value "cmd.exe /c c:\temp\resetpwd.cmd" -Type String -Force
 
@@ -2021,13 +1946,6 @@ del /F C:\Temp\resetpwd.cmd > NUL
 
         Write-Host "Password reset script placed. The password for '$Username' will be changed on next VM boot." -ForegroundColor Green
     }
-    catch {
-        Write-Error "ResetLocalAdminPassword failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 function DisableThirdPartyDrivers {
@@ -2037,76 +1955,64 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
 "@)) { return }
 
     Write-Host "Enumerating and disabling non-Microsoft kernel drivers..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
-        $SystemRoot   = Get-SystemRootPath
-        $ServicesRoot = "$SystemRoot\Services"
+    Invoke-WithHive 'SYSTEM' {
+        & {
+            $SystemRoot = Get-SystemRootPath
+            $ServicesRoot = "$SystemRoot\Services"
 
-        # Kernel-mode start types: 0=Boot, 1=System, 2=Auto, 3=Manual, 4=Disabled
-        # Target Boot(0) and System(1) drivers that are third-party
+            # Kernel-mode start types: 0=Boot, 1=System, 2=Auto, 3=Manual, 4=Disabled
+            # Target Boot(0) and System(1) drivers that are third-party
 
-        $disabled = @()
-        Get-ChildItem $ServicesRoot -ErrorAction SilentlyContinue | ForEach-Object {
-            $svcPath = $_.PSPath
-            $props = Get-ItemProperty -Path $svcPath -ErrorAction SilentlyContinue
-            # Only kernel/filesystem drivers (Type 1=kernel, 2=filesystem)
-            if ($props.Type -notin @(1, 2)) { return }
-            # Only Boot and System start drivers
-            if ($props.Start -notin @(0, 1)) { return }
-            # Skip if already disabled
-            if ($props.Start -eq 4) { return }
+            $disabled = @()
+            Get-ChildItem $ServicesRoot -ErrorAction SilentlyContinue | ForEach-Object {
+                $svcPath = $_.PSPath
+                $props = Get-ItemProperty -Path $svcPath -ErrorAction SilentlyContinue
+                # Only kernel/filesystem drivers (Type 1=kernel, 2=filesystem)
+                if ($props.Type -notin @(1, 2)) { return }
+                # Only Boot and System start drivers
+                if ($props.Start -notin @(0, 1)) { return }
+                # Skip if already disabled
+                if ($props.Start -eq 4) { return }
 
-            $imagePathRaw = $props.ImagePath
-            if (-not $imagePathRaw) { return }
-            $imagePath = $imagePathRaw `
-                -replace '(?i)\\SystemRoot\\', "$script:WinDriveLetter\Windows\" `
-                -replace '(?i)%SystemRoot%',   "$script:WinDriveLetter\Windows" `
-                -replace '(?i)\\\?\?\\',   '' `
-                -replace '(?i)^system32\\',   "$script:WinDriveLetter\Windows\System32\\"
-            if ($imagePath -match '^(.+?\.(?:sys|exe))') { $imagePath = $Matches[1] }
+                $imagePathRaw = $props.ImagePath
+                if (-not $imagePathRaw) { return }
+                $imagePath = Resolve-GuestImagePath $imagePathRaw
 
-            # Read the binary to check the company name in version info.
-            # If the binary is missing, treat the driver as third-party — a missing
-            # Boot/System binary will cause a BSOD on next boot regardless of vendor.
-            $isMicrosoft   = $false
-            $binaryMissing = $false
-            if (Test-Path $imagePath) {
-                $vi = (Get-Item $imagePath -ErrorAction SilentlyContinue).VersionInfo
-                if ($vi -and $vi.CompanyName -match 'Microsoft') { $isMicrosoft = $true }
+                # Read the binary to check the company name in version info.
+                # If the binary is missing, treat the driver as third-party — a missing
+                # Boot/System binary will cause a BSOD on next boot regardless of vendor.
+                $isMicrosoft = $false
+                $binaryMissing = $false
+                if (Test-Path $imagePath) {
+                    $vi = (Get-Item $imagePath -ErrorAction SilentlyContinue).VersionInfo
+                    if ($vi -and $vi.CompanyName -match 'Microsoft') { $isMicrosoft = $true }
+                }
+                else {
+                    $binaryMissing = $true   # missing binary -> will BSOD -> must disable
+                }
+
+                if (-not $isMicrosoft) {
+                    $svcName = $_.PSChildName
+                    $tag = if ($binaryMissing) { ' [binary missing - will BSOD on boot]' } else { '' }
+                    Write-Host "  Disabling: $svcName$tag  ($imagePathRaw)" -ForegroundColor Yellow
+                    Set-ItemProperty-Logged -Path $svcPath -Name Start -Value 4 -Type DWord -Force
+                    $disabled += [PSCustomObject]@{ Service = $svcName; ImagePath = $imagePathRaw; PreviousStart = $props.Start }
+                }
+            }
+
+            if ($disabled.Count -eq 0) {
+                Write-Host "No non-Microsoft Boot/System drivers found to disable." -ForegroundColor Green
             }
             else {
-                $binaryMissing = $true   # missing binary -> will BSOD -> must disable
-            }
-
-            if (-not $isMicrosoft) {
-                $svcName = $_.PSChildName
-                $tag = if ($binaryMissing) { ' [binary missing - will BSOD on boot]' } else { '' }
-                Write-Host "  Disabling: $svcName$tag  ($imagePathRaw)" -ForegroundColor Yellow
-                Set-ItemProperty-Logged -Path $svcPath -Name Start -Value 4 -Type DWord -Force
-                $disabled += [PSCustomObject]@{ Service = $svcName; ImagePath = $imagePathRaw; PreviousStart = $props.Start }
+                Write-Host "`nDisabled $($disabled.Count) third-party driver(s)." -ForegroundColor Green
+                Write-Host "`n--- TO RE-ENABLE (run -EnableThirdPartyDrivers or run on the VM after recovery) ---" -ForegroundColor Cyan
+                foreach ($d in $disabled) {
+                    $livePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($d.Service)"
+                    Write-Host "Set-ItemProperty -Path '$livePath' -Name Start -Value $($d.PreviousStart) -Type DWord -Force" -ForegroundColor White
+                }
+                Write-Host "----------------------------------------------------`n" -ForegroundColor Cyan
             }
         }
-
-        if ($disabled.Count -eq 0) {
-            Write-Host "No non-Microsoft Boot/System drivers found to disable." -ForegroundColor Green
-        }
-        else {
-            Write-Host "`nDisabled $($disabled.Count) third-party driver(s)." -ForegroundColor Green
-            Write-Host "`n--- TO RE-ENABLE (run -EnableThirdPartyDrivers or run on the VM after recovery) ---" -ForegroundColor Cyan
-            foreach ($d in $disabled) {
-                $livePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($d.Service)"
-                Write-Host "Set-ItemProperty -Path '$livePath' -Name Start -Value $($d.PreviousStart) -Type DWord -Force" -ForegroundColor White
-            }
-            Write-Host "----------------------------------------------------`n" -ForegroundColor Cyan
-        }
-    }
-    catch {
-        Write-Error "DisableThirdPartyDrivers failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -2128,229 +2034,205 @@ function GetServicesReport {
     # then alphabetically within each group.
 
     $reportLabel = if ($IncludeServices) { 'services/drivers' } else { 'drivers' }
-    $modeLabel   = if ($IssuesOnly) { ' (issues only)' } else { '' }
+    $modeLabel = if ($IssuesOnly) { ' (issues only)' } else { '' }
     Write-Host "`nBuilding offline $reportLabel report$modeLabel..." -ForegroundColor Cyan
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
-        $SystemRoot   = Get-SystemRootPath
-        $ServicesRoot = "$SystemRoot\Services"
+    Invoke-WithHive 'SYSTEM' {
+        & {
+            $SystemRoot = Get-SystemRootPath
+            $ServicesRoot = "$SystemRoot\Services"
 
-        $startNames = @{ 0='Boot'; 1='System'; 2='Automatic'; 3='Manual'; 4='Disabled' }
-        $typeNames  = @{ 1='KernelDriver'; 2='FileSystemDriver'; 4='Adapter'; 8='Recognizer';
-                         16='Win32Own'; 32='Win32Share'; 256='Interactive' }
+            $startNames = @{ 0 = 'Boot'; 1 = 'System'; 2 = 'Automatic'; 3 = 'Manual'; 4 = 'Disabled' }
+            $typeNames = @{ 1 = 'KernelDriver'; 2 = 'FileSystemDriver'; 4 = 'Adapter'; 8 = 'Recognizer';
+                16 = 'Win32Own'; 32 = 'Win32Share'; 256 = 'Interactive' 
+            }
 
-        $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
+            $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-        Get-ChildItem $ServicesRoot -ErrorAction SilentlyContinue | ForEach-Object {
-            $props = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
-            if (-not $props) { return }
+            Get-ChildItem $ServicesRoot -ErrorAction SilentlyContinue | ForEach-Object {
+                $props = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+                if (-not $props) { return }
 
-            $startVal = $props.Start
-            $typeVal  = $props.Type
-            # Skip entries with no Start or no Type (e.g. sub-keys that are not real services)
-            if ($null -eq $startVal -or $null -eq $typeVal) { return }
+                $startVal = $props.Start
+                $typeVal = $props.Type
+                # Skip entries with no Start or no Type (e.g. sub-keys that are not real services)
+                if ($null -eq $startVal -or $null -eq $typeVal) { return }
 
-            $startLabel = if ($startNames.ContainsKey([int]$startVal)) { $startNames[[int]$startVal] } else { "Unknown($startVal)" }
-            $typeLabel  = if ($typeNames.ContainsKey([int]$typeVal))   { $typeNames[[int]$typeVal]   } else { "Type($typeVal)" }
+                $startLabel = if ($startNames.ContainsKey([int]$startVal)) { $startNames[[int]$startVal] } else { "Unknown($startVal)" }
+                $typeLabel = if ($typeNames.ContainsKey([int]$typeVal)) { $typeNames[[int]$typeVal] } else { "Type($typeVal)" }
 
-            $imgRaw  = $props.ImagePath
-            $imgPath = $null
-            $present = $null    # $null = no ImagePath registered
-            $vendor  = 'N/A'
+                $imgRaw = $props.ImagePath
+                $imgPath = $null
+                $present = $null    # $null = no ImagePath registered
+                $vendor = 'N/A'
 
-            if ($imgRaw) {
-                $winDrive = $script:WinDriveLetter.TrimEnd('\')
-                $imgPath = $imgRaw `
-                    -replace '(?i)\\SystemRoot\\',  "$winDrive\Windows\" `
-                    -replace '(?i)%SystemRoot%',    "$winDrive\Windows" `
-                    -replace '(?i)\\\?\?\\',       '' `
-                    -replace '(?i)^system32\\',    "$winDrive\Windows\System32\" `
-                    -replace '(?i)^"?[A-Z]:\\',    "$winDrive\"   # rebase any absolute guest path (C:\...) to the offline drive
-                if ($imgPath -match '^(.+?\.(?:sys|exe|dll))') { $imgPath = $Matches[1] }
+                if ($imgRaw) {
+                    $imgPath = Resolve-GuestImagePath $imgRaw
 
-                if (Test-Path $imgPath) {
-                    $present = $true
-                    $vi = (Get-Item $imgPath -ErrorAction SilentlyContinue).VersionInfo
-                    $vendor = if ($vi -and $vi.CompanyName) { $vi.CompanyName.Trim() } else { '(no version info)' }
-                } else {
-                    $present = $false
-                    $vendor  = '(binary missing)'
+                    if (Test-Path $imgPath) {
+                        $present = $true
+                        $vi = (Get-Item $imgPath -ErrorAction SilentlyContinue).VersionInfo
+                        $vendor = if ($vi -and $vi.CompanyName) { $vi.CompanyName.Trim() } else { '(no version info)' }
+                    }
+                    else {
+                        $present = $false
+                        $vendor = '(binary missing)'
+                    }
                 }
+
+                $rows.Add([PSCustomObject]@{
+                        Name          = $_.PSChildName
+                        Start         = $startLabel
+                        StartVal      = [int]$startVal
+                        TypeVal       = [int]$typeVal
+                        Type          = $typeLabel
+                        Group         = if ($props.Group) { $props.Group } else { '' }
+                        Vendor        = $vendor
+                        BinaryPresent = $present
+                        ImagePath     = if ($imgRaw) { $imgRaw } else { '' }
+                        ErrorControl  = if ($null -ne $props.ErrorControl) { [int]$props.ErrorControl } else { $null }
+                    })
             }
 
-            $rows.Add([PSCustomObject]@{
-                Name          = $_.PSChildName
-                Start         = $startLabel
-                StartVal      = [int]$startVal
-                TypeVal       = [int]$typeVal
-                Type          = $typeLabel
-                Group         = if ($props.Group) { $props.Group } else { '' }
-                Vendor        = $vendor
-                BinaryPresent = $present
-                ImagePath     = if ($imgRaw) { $imgRaw } else { '' }
-                ErrorControl  = if ($null -ne $props.ErrorControl) { [int]$props.ErrorControl } else { $null }
-            })
-        }
+            # Filter to drivers only unless -IncludeServices was given.
+            # Driver types: 1=KernelDriver, 2=FileSystemDriver, 4=Adapter, 8=Recognizer
+            if (-not $IncludeServices) {
+                $rows = [System.Collections.Generic.List[PSCustomObject]]($rows | Where-Object { $_.TypeVal -in @(1, 2, 4, 8) })
+            }
 
-        # Filter to drivers only unless -IncludeServices was given.
-        # Driver types: 1=KernelDriver, 2=FileSystemDriver, 4=Adapter, 8=Recognizer
-        if (-not $IncludeServices) {
-            $rows = [System.Collections.Generic.List[PSCustomObject]]($rows | Where-Object { $_.TypeVal -in @(1,2,4,8) })
-        }
+            # Filter to issue rows only when -IssuesOnly is given.
+            # An issue row is one that warrants attention:
+            #   - Missing binary (any vendor)
+            #   - Non-Microsoft vendor with a binary present
+            #   - ErrorControl >= 2 (Severe/Critical) AND non-Microsoft vendor
+            #     (Microsoft inbox drivers legitimately carry CRIT/Sev ErrorControl - that is normal)
+            if ($IssuesOnly) {
+                $rows = [System.Collections.Generic.List[PSCustomObject]]($rows | Where-Object {
+                        $isMsVendor = $_.Vendor -match 'Microsoft'
+                        $_.BinaryPresent -eq $false -or
+                        ($_.BinaryPresent -eq $true -and -not $isMsVendor) -or
+                        ($null -ne $_.ErrorControl -and $_.ErrorControl -ge 2 -and -not $isMsVendor)
+                    })
+            }
 
-        # Filter to issue rows only when -IssuesOnly is given.
-        # An issue row is one that warrants attention:
-        #   - Missing binary (any vendor)
-        #   - Non-Microsoft vendor with a binary present
-        #   - ErrorControl >= 2 (Severe/Critical) AND non-Microsoft vendor
-        #     (Microsoft inbox drivers legitimately carry CRIT/Sev ErrorControl - that is normal)
-        if ($IssuesOnly) {
-            $rows = [System.Collections.Generic.List[PSCustomObject]]($rows | Where-Object {
-                $isMsVendor = $_.Vendor -match 'Microsoft'
-                $_.BinaryPresent -eq $false -or
-                ($_.BinaryPresent -eq $true -and -not $isMsVendor) -or
-                ($null -ne $_.ErrorControl -and $_.ErrorControl -ge 2 -and -not $isMsVendor)
-            })
-        }
+            if ($rows.Count -eq 0) {
+                $noneMsg = if ($IssuesOnly) { "No issues found in the offline $reportLabel ControlSet - all entries look healthy." } else { "No $reportLabel entries found in the offline ControlSet." }
+                Write-Host "  $noneMsg" -ForegroundColor $(if ($IssuesOnly) { 'Green' } else { 'DarkGray' })
+                return
+            }
 
-        if ($rows.Count -eq 0) {
-            $noneMsg = if ($IssuesOnly) { "No issues found in the offline $reportLabel ControlSet - all entries look healthy." } else { "No $reportLabel entries found in the offline ControlSet." }
-            Write-Host "  $noneMsg" -ForegroundColor $(if ($IssuesOnly) { 'Green' } else { 'DarkGray' })
-            return
-        }
+            # Group by Start value, then sort alphabetically within each group
+            $grouped = $rows | Sort-Object StartVal, Name
 
-        # Group by Start value, then sort alphabetically within each group
-        $grouped = $rows | Sort-Object StartVal, Name
-
-        $currentStart = $null
-        foreach ($r in $grouped) {
-            if ($r.Start -ne $currentStart) {
-                $currentStart = $r.Start
-                $headerColor  = switch ($r.Start) {
-                    'Boot'      { 'Red'    }
-                    'System'    { 'Yellow' }
-                    'Automatic' { 'Cyan'   }
-                    'Manual'    { 'White'  }
-                    'Disabled'  { 'DarkGray' }
-                    default     { 'Gray'   }
+            $currentStart = $null
+            foreach ($r in $grouped) {
+                if ($r.Start -ne $currentStart) {
+                    $currentStart = $r.Start
+                    $headerColor = switch ($r.Start) {
+                        'Boot' { 'Red' }
+                        'System' { 'Yellow' }
+                        'Automatic' { 'Cyan' }
+                        'Manual' { 'White' }
+                        'Disabled' { 'DarkGray' }
+                        default { 'Gray' }
+                    }
+                    Write-Host "`n  == $($r.Start.ToUpper()) =========================================" -ForegroundColor $headerColor
+                    Write-Host ("  {0,-30} {1,-28} {2,-6} {3,-6} {4}" -f 'Name', 'Vendor', '[Pres]', 'ErCtl', 'ImagePath') -ForegroundColor DarkGray
+                    Write-Host ("  {0,-30} {1,-28} {2,-6} {3,-6} {4}" -f ('-' * 30), ('-' * 28), '------', '------', ('-' * 40)) -ForegroundColor DarkGray
                 }
-                Write-Host "`n  == $($r.Start.ToUpper()) =========================================" -ForegroundColor $headerColor
-                Write-Host ("  {0,-30} {1,-28} {2,-6} {3,-6} {4}" -f 'Name','Vendor','[Pres]','ErCtl','ImagePath') -ForegroundColor DarkGray
-                Write-Host ("  {0,-30} {1,-28} {2,-6} {3,-6} {4}" -f ('-'*30),('-'*28),'------','------',('-'*40)) -ForegroundColor DarkGray
+
+                # Colour logic: missing binary = Red, non-Microsoft = Yellow, Microsoft = Green, N/A = Gray
+                $isMicrosoft = $r.Vendor -match 'Microsoft'
+                $isMissing = $r.BinaryPresent -eq $false
+                $noPath = $null -eq $r.BinaryPresent
+
+                $rowColor = if ($isMissing) { 'Red' }
+                elseif ($noPath) { 'DarkGray' }
+                elseif ($isMicrosoft) { 'Green' }
+                else { 'Yellow' }
+
+                $presTag = if ($isMissing) { 'MISS' } elseif ($noPath) { ' -- ' } else { ' OK ' }
+                $vendorShort = if ($r.Vendor.Length -gt 28) { $r.Vendor.Substring(0, 25) + '...' } else { $r.Vendor }
+
+                # ErrorControl: 0=Ignore, 1=Normal, 2=Severe (LKGC fallback), 3=Critical (boot failure)
+                $errCtlLabel = if ($null -eq $r.ErrorControl) { '    ' } else {
+                    switch ($r.ErrorControl) { 0 { 'Ign' } 1 { 'Norm' } 2 { 'Sev!' } 3 { 'CRIT' } default { "EC$($r.ErrorControl)" } }
+                }
+
+                Write-Host ("  {0,-30} {1,-28} [{2}] {3,-6} {4}" -f $r.Name, $vendorShort, $presTag, $errCtlLabel, $r.ImagePath) -ForegroundColor $rowColor
             }
 
-            # Colour logic: missing binary = Red, non-Microsoft = Yellow, Microsoft = Green, N/A = Gray
-            $isMicrosoft = $r.Vendor -match 'Microsoft'
-            $isMissing   = $r.BinaryPresent -eq $false
-            $noPath      = $null -eq $r.BinaryPresent
+            # Summary
+            $total = $rows.Count
+            $missing = @($rows | Where-Object { $_.BinaryPresent -eq $false }).Count
+            $nonMS = @($rows | Where-Object { $_.BinaryPresent -eq $true -and $_.Vendor -notmatch 'Microsoft' }).Count
+            $boot_sys = @($rows | Where-Object { $_.StartVal -in @(0, 1) }).Count
+            $sevCrit = @($rows | Where-Object { $null -ne $_.ErrorControl -and $_.ErrorControl -ge 2 }).Count
 
-            $rowColor = if ($isMissing)      { 'Red'     }
-                        elseif ($noPath)     { 'DarkGray'}
-                        elseif ($isMicrosoft){ 'Green'   }
-                        else                 { 'Yellow'  }
-
-            $presTag = if ($isMissing) { 'MISS' } elseif ($noPath) { ' -- ' } else { ' OK ' }
-            $vendorShort = if ($r.Vendor.Length -gt 28) { $r.Vendor.Substring(0,25) + '...' } else { $r.Vendor }
-
-            # ErrorControl: 0=Ignore, 1=Normal, 2=Severe (LKGC fallback), 3=Critical (boot failure)
-            $errCtlLabel = if ($null -eq $r.ErrorControl) { '    ' } else {
-                switch ($r.ErrorControl) { 0{'Ign'} 1{'Norm'} 2{'Sev!'} 3{'CRIT'} default{"EC$($r.ErrorControl)"} }
+            Write-Host "`n  ===========================================================" -ForegroundColor Cyan
+            Write-Host ("  Total {0}: {1}  |  Boot/System: {2}  |  Missing binary: {3}  |  Non-Microsoft: {4}  |  Severe/Critical EC: {5}" `
+                    -f $reportLabel, $total, $boot_sys, $missing, $nonMS, $sevCrit) -ForegroundColor Cyan
+            if ($missing -gt 0) {
+                Write-Host "  [!] Missing-binary Boot/System drivers will cause a BSOD - run -DisableThirdPartyDrivers to neutralise them." -ForegroundColor Red
             }
-
-            Write-Host ("  {0,-30} {1,-28} [{2}] {3,-6} {4}" -f $r.Name, $vendorShort, $presTag, $errCtlLabel, $r.ImagePath) -ForegroundColor $rowColor
+            if ($nonMS -gt 0) {
+                Write-Host "  [!] Non-Microsoft drivers present - verify each is expected for this guest OS." -ForegroundColor Yellow
+            }
+            if ($sevCrit -gt 0) {
+                Write-Host "  [!] $sevCrit driver(s) with ErrorControl Sev!(2) or CRIT(3) - failure of these at boot will trigger LKGC fallback or halt the system." -ForegroundColor Yellow
+            }
+            Write-Host "  ===========================================================`n" -ForegroundColor Cyan
         }
-
-        # Summary
-        $total    = $rows.Count
-        $missing  = @($rows | Where-Object { $_.BinaryPresent -eq $false }).Count
-        $nonMS    = @($rows | Where-Object { $_.BinaryPresent -eq $true -and $_.Vendor -notmatch 'Microsoft' }).Count
-        $boot_sys = @($rows | Where-Object { $_.StartVal -in @(0,1) }).Count
-        $sevCrit  = @($rows | Where-Object { $null -ne $_.ErrorControl -and $_.ErrorControl -ge 2 }).Count
-
-        Write-Host "`n  ===========================================================" -ForegroundColor Cyan
-        Write-Host ("  Total {0}: {1}  |  Boot/System: {2}  |  Missing binary: {3}  |  Non-Microsoft: {4}  |  Severe/Critical EC: {5}" `
-            -f $reportLabel, $total, $boot_sys, $missing, $nonMS, $sevCrit) -ForegroundColor Cyan
-        if ($missing -gt 0) {
-            Write-Host "  [!] Missing-binary Boot/System drivers will cause a BSOD - run -DisableThirdPartyDrivers to neutralise them." -ForegroundColor Red
-        }
-        if ($nonMS -gt 0) {
-            Write-Host "  [!] Non-Microsoft drivers present - verify each is expected for this guest OS." -ForegroundColor Yellow
-        }
-        if ($sevCrit -gt 0) {
-            Write-Host "  [!] $sevCrit driver(s) with ErrorControl Sev!(2) or CRIT(3) - failure of these at boot will trigger LKGC fallback or halt the system." -ForegroundColor Yellow
-        }
-        Write-Host "  ===========================================================`n" -ForegroundColor Cyan
-    }
-    catch {
-        Write-Error "GetServicesReport failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
 function EnableThirdPartyDrivers {
     Write-Host "Re-enabling previously disabled third-party kernel drivers..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
-        $SystemRoot   = Get-SystemRootPath
-        $ServicesRoot = "$SystemRoot\Services"
+    Invoke-WithHive 'SYSTEM' {
+        & {
+            $SystemRoot = Get-SystemRootPath
+            $ServicesRoot = "$SystemRoot\Services"
 
-        $reEnabled = @()
-        Get-ChildItem $ServicesRoot -ErrorAction SilentlyContinue | ForEach-Object {
-            $svcPath = $_.PSPath
-            $props = Get-ItemProperty -Path $svcPath -ErrorAction SilentlyContinue
-            # Only disabled kernel/filesystem drivers
-            if ($props.Type -notin @(1, 2)) { return }
-            if ($props.Start -ne 4) { return }
+            $reEnabled = @()
+            Get-ChildItem $ServicesRoot -ErrorAction SilentlyContinue | ForEach-Object {
+                $svcPath = $_.PSPath
+                $props = Get-ItemProperty -Path $svcPath -ErrorAction SilentlyContinue
+                # Only disabled kernel/filesystem drivers
+                if ($props.Type -notin @(1, 2)) { return }
+                if ($props.Start -ne 4) { return }
 
-            $imagePathRaw = $props.ImagePath
-            if (-not $imagePathRaw) { return }
-            $imagePath = $imagePathRaw `
-                -replace '(?i)\\SystemRoot\\', "$script:WinDriveLetter\Windows\" `
-                -replace '(?i)%SystemRoot%',   "$script:WinDriveLetter\Windows" `
-                -replace '(?i)\\\?\?\\',   '' `
-                -replace '(?i)^system32\\',   "$script:WinDriveLetter\Windows\System32\\"
-            if ($imagePath -match '^(.+?\.(?:sys|exe))') { $imagePath = $Matches[1] }
+                $imagePathRaw = $props.ImagePath
+                if (-not $imagePathRaw) { return }
+                $imagePath = Resolve-GuestImagePath $imagePathRaw
 
-            $isMicrosoft = $false
-            if (Test-Path $imagePath) {
-                $vi = (Get-Item $imagePath -ErrorAction SilentlyContinue).VersionInfo
-                if ($vi -and $vi.CompanyName -match 'Microsoft') { $isMicrosoft = $true }
+                $isMicrosoft = $false
+                if (Test-Path $imagePath) {
+                    $vi = (Get-Item $imagePath -ErrorAction SilentlyContinue).VersionInfo
+                    if ($vi -and $vi.CompanyName -match 'Microsoft') { $isMicrosoft = $true }
+                }
+                else {
+                    # Binary is missing - warn and skip re-enabling (re-enabling a driver with a
+                    # missing binary will cause a BSOD on boot).
+                    Write-Warning "Skipping $($_.PSChildName) - binary is missing ($imagePath). Restore the driver file before re-enabling."
+                    return
+                }
+
+                if (-not $isMicrosoft) {
+                    $svcName = $_.PSChildName
+                    # Restore to System (1) start — safest default for a previously Boot/System driver
+                    Write-Host "  Re-enabling: $svcName" -ForegroundColor Yellow
+                    Set-ItemProperty-Logged -Path $svcPath -Name Start -Value 1 -Type DWord -Force
+                    $reEnabled += $svcName
+                }
+            }
+
+            if ($reEnabled.Count -eq 0) {
+                Write-Host "No disabled third-party Boot/System drivers found to re-enable." -ForegroundColor Green
             }
             else {
-                # Binary is missing - warn and skip re-enabling (re-enabling a driver with a
-                # missing binary will cause a BSOD on boot).
-                Write-Warning "Skipping $($_.PSChildName) - binary is missing ($imagePath). Restore the driver file before re-enabling."
-                return
-            }
-
-            if (-not $isMicrosoft) {
-                $svcName = $_.PSChildName
-                # Restore to System (1) start — safest default for a previously Boot/System driver
-                Write-Host "  Re-enabling: $svcName" -ForegroundColor Yellow
-                Set-ItemProperty-Logged -Path $svcPath -Name Start -Value 1 -Type DWord -Force
-                $reEnabled += $svcName
+                Write-Host "`nRe-enabled $($reEnabled.Count) driver(s): $($reEnabled -join ', ')" -ForegroundColor Green
+                Write-Warning "Start value restored to 1 (System). If a driver was originally Boot (0), adjust manually after verifying VM boots." 
             }
         }
-
-        if ($reEnabled.Count -eq 0) {
-            Write-Host "No disabled third-party Boot/System drivers found to re-enable." -ForegroundColor Green
-        }
-        else {
-            Write-Host "`nRe-enabled $($reEnabled.Count) driver(s): $($reEnabled -join ', ')" -ForegroundColor Green
-            Write-Warning "Start value restored to 1 (System). If a driver was originally Boot (0), adjust manually after verifying VM boots." 
-        }
-    }
-    catch {
-        Write-Error "EnableThirdPartyDrivers failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -2377,10 +2259,10 @@ function Remove-CredentialGuardUefiLock {
         return
     }
 
-    $efiVolume  = $script:BootDriveLetter.TrimEnd('\')
-    $storePath  = "$efiVolume\EFI\Microsoft\Boot\BCD"
-    $secDest    = "$efiVolume\EFI\Microsoft\Boot\SecConfig.efi"
-    $secSrc     = "$env:SystemRoot\System32\SecConfig.efi"
+    $efiVolume = $script:BootDriveLetter.TrimEnd('\')
+    $storePath = "$efiVolume\EFI\Microsoft\Boot\BCD"
+    $secDest = "$efiVolume\EFI\Microsoft\Boot\SecConfig.efi"
+    $secSrc = "$env:SystemRoot\System32\SecConfig.efi"
 
     if (-not (Test-Path $secSrc)) {
         Write-Warning "  SecConfig.efi not found at '$secSrc' on this host."
@@ -2420,7 +2302,7 @@ function Remove-CredentialGuardUefiLock {
 
         Write-Host "  [OK] SecConfig.efi one-time boot entry added to offline BCD." -ForegroundColor Green
         Write-Host ("  On the VM's first boot back on Azure, SecConfig.efi will run inside the VM " +
-                    "and clear the Credential Guard EFI NVRAM variable automatically.") -ForegroundColor Cyan
+            "and clear the Credential Guard EFI NVRAM variable automatically.") -ForegroundColor Cyan
     }
     catch {
         Write-Warning "  bcdedit SecConfig.efi setup failed: $_"
@@ -2430,20 +2312,16 @@ function Remove-CredentialGuardUefiLock {
 
 function DisableCredentialGuard {
     Write-Host "Disabling Credential Guard and LSA protection..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    $uefiLockWasActive  = $false
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
+    Invoke-WithHive 'SYSTEM','SOFTWARE' {
         $SystemRoot = Get-SystemRootPath
 
-        $lsaPath   = "$SystemRoot\Control\Lsa"
-        $cgPath    = "HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+        $lsaPath = "$SystemRoot\Control\Lsa"
+        $cgPath = "HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
         $cgSysPath = "$SystemRoot\Control\DeviceGuard"
 
         # Snapshot for restore
-        $beforeRunAsPPL  = (Get-ItemProperty $lsaPath   -ErrorAction SilentlyContinue).RunAsPPL
-        $beforeLsaCfg    = (Get-ItemProperty $cgSysPath -ErrorAction SilentlyContinue).LsaCfgFlags
+        $beforeRunAsPPL = (Get-ItemProperty $lsaPath   -ErrorAction SilentlyContinue).RunAsPPL
+        $beforeLsaCfg = (Get-ItemProperty $cgSysPath -ErrorAction SilentlyContinue).LsaCfgFlags
         $beforeCGEnabled = (Get-ItemProperty $cgPath    -ErrorAction SilentlyContinue).EnableVirtualizationBasedSecurity
 
         # Detect UEFI lock: LsaCfgFlags=1 in Control\Lsa means CG was enabled WITH UEFI lock.
@@ -2453,8 +2331,8 @@ function DisableCredentialGuard {
         if ($lsaLsaCfgFlags -eq 1) {
             $uefiLockWasActive = $true
             Write-Warning ("Credential Guard was enabled WITH UEFI lock (Control\Lsa\LsaCfgFlags=1). " +
-                           "An EFI NVRAM variable is also set - registry changes alone are not sufficient. " +
-                           "The UEFI firmware variable will be cleared after applying registry changes.")
+                "An EFI NVRAM variable is also set - registry changes alone are not sufficient. " +
+                "The UEFI firmware variable will be cleared after applying registry changes.")
         }
         elseif ($lsaLsaCfgFlags -eq 2) {
             Write-Host "  Credential Guard mode: WITHOUT UEFI lock - registry changes are sufficient." -ForegroundColor Cyan
@@ -2471,23 +2349,15 @@ function DisableCredentialGuard {
 
         Write-Host "Credential Guard registry settings cleared. Use -EnableCredentialGuard to revert." -ForegroundColor Green
         Write-Host "`n--- REVERT COMMANDS (run on the VM after recovery) ---" -ForegroundColor Cyan
-        $lsaLive   = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+        $lsaLive = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
         $cgSysLive = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
-        $cgLive    = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+        $cgLive = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
         Write-Host "Set-ItemProperty -Path '$lsaLive'   -Name RunAsPPL    -Value $(if ($null -ne $beforeRunAsPPL) { $beforeRunAsPPL } else { '1 # (was not set)' }) -Type DWord -Force" -ForegroundColor White
         Write-Host "Set-ItemProperty -Path '$cgSysLive' -Name LsaCfgFlags -Value $(if ($null -ne $beforeLsaCfg)  { $beforeLsaCfg  } else { '1 # (was not set)' }) -Type DWord -Force" -ForegroundColor White
         if ($null -ne $beforeCGEnabled) {
             Write-Host "Set-ItemProperty -Path '$cgLive' -Name EnableVirtualizationBasedSecurity -Value $beforeCGEnabled -Type DWord -Force" -ForegroundColor White
         }
         Write-Host "------------------------------------------------------`n" -ForegroundColor Cyan
-    }
-    catch {
-        Write-Error "DisableCredentialGuard failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-        UnmountOffHive -Hive "SOFTWARE"
     }
 
     # Hives are now safely unmounted. Clear the EFI NVRAM variable if UEFI lock was active.
@@ -2510,19 +2380,16 @@ function EnableCredentialGuard {
     # ----------------------------------------------------------------
     if ($script:VMGen -eq 1) {
         Write-Error ("BLOCKED: This disk uses MBR/BIOS (Gen1). Credential Guard requires UEFI Secure Boot " +
-                     "(Gen2/GPT). Enabling it on a Gen1 VM writes flags that prevent Windows from booting. Aborting.")
+            "(Gen2/GPT). Enabling it on a Gen1 VM writes flags that prevent Windows from booting. Aborting.")
         return
     }
     if ($null -eq $script:VMGen) {
         Write-Error ("BLOCKED: Disk partition style could not be determined (expected MBR=Gen1 or GPT=Gen2). " +
-                     "Credential Guard requires UEFI/GPT (Gen2). Aborting to prevent a potential no-boot scenario.")
+            "Credential Guard requires UEFI/GPT (Gen2). Aborting to prevent a potential no-boot scenario.")
         return
     }
 
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
+    Invoke-WithHive 'SYSTEM','SOFTWARE' {
         $SystemRoot = Get-SystemRootPath
 
         # ----------------------------------------------------------------
@@ -2531,25 +2398,26 @@ function EnableCredentialGuard {
         # the same registry flags but Windows will fail a boot-time licence
         # check resulting in an unbootable VM.
         # ----------------------------------------------------------------
-        $winVer      = Get-ItemProperty "HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
-        $editionId   = $winVer.EditionID
+        $winVer = Get-ItemProperty "HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+        $editionId = $winVer.EditionID
         $productName = $winVer.ProductName
         $unsupportedEditions = @('Home', 'Pro', 'CoreSingleLanguage', 'Core', 'ProWorkstation', 'ProfessionalWorkstation')
         $editionBlocked = $unsupportedEditions | Where-Object { $editionId -match $_ }
         if ($editionBlocked) {
             Write-Error ("BLOCKED: Windows edition '$editionId' ($productName) does not support Credential Guard. " +
-                         "Only Enterprise, Education, and Server editions are supported. Aborting.")
+                "Only Enterprise, Education, and Server editions are supported. Aborting.")
             return
         }
         if ($editionId) {
             Write-Host "  Windows edition: $editionId ($productName) - supported." -ForegroundColor Cyan
-        } else {
+        }
+        else {
             Write-Warning "  Could not read Windows edition from offline hive; proceeding with caution."
         }
 
-        $lsaPath   = "$SystemRoot\Control\Lsa"
+        $lsaPath = "$SystemRoot\Control\Lsa"
         $cgSysPath = "$SystemRoot\Control\DeviceGuard"
-        $cgPath    = "HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+        $cgPath = "HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
 
         Set-ItemProperty-Logged -Path $lsaPath   -Name RunAsPPL     -Value 1 -Type DWord -Force
         Set-ItemProperty-Logged -Path $cgSysPath -Name LsaCfgFlags  -Value 1 -Type DWord -Force
@@ -2560,16 +2428,8 @@ function EnableCredentialGuard {
 
         Write-Host "Credential Guard and LSA protection re-enabled." -ForegroundColor Green
         Write-Warning ("Before starting the VM, verify in Hyper-V settings that: " +
-                       "(1) Secure Boot is enabled, (2) Virtualization Based Security (VBS) is enabled. " +
-                       "If either is missing the VM will fail to boot. Use -DisableCredentialGuard to revert.")
-    }
-    catch {
-        Write-Error "EnableCredentialGuard failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-        UnmountOffHive -Hive "SOFTWARE"
+            "(1) Secure Boot is enabled, (2) Virtualization Based Security (VBS) is enabled. " +
+            "If either is missing the VM will fail to boot. Use -DisableCredentialGuard to revert.")
     }
 }
 
@@ -2592,10 +2452,7 @@ function DisableAppLocker {
     #   2 = Audit only
 
     Write-Host "Disabling AppLocker enforcement..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
+    Invoke-WithHive 'SYSTEM','SOFTWARE' {
         $SystemRoot = Get-SystemRootPath
 
         # Rule collection names that AppLocker enforces
@@ -2627,8 +2484,8 @@ function DisableAppLocker {
         }
 
         # --- Check AppIDSvc start value ---
-        $appIdPath    = "$SystemRoot\Services\AppIDSvc"
-        $appIdStart   = if (Test-Path $appIdPath) { (Get-ItemProperty $appIdPath -ErrorAction SilentlyContinue).Start } else { $null }
+        $appIdPath = "$SystemRoot\Services\AppIDSvc"
+        $appIdStart = if (Test-Path $appIdPath) { (Get-ItemProperty $appIdPath -ErrorAction SilentlyContinue).Start } else { $null }
         # Service runs if Start is 2 (Auto) or 3 (Manual/demand); 4 = Disabled, 1 = Boot (unlikely)
         $appIdRunning = $null -ne $appIdStart -and $appIdStart -in @(1, 2, 3)
 
@@ -2649,34 +2506,25 @@ function DisableAppLocker {
         if ($appIdRunning) {
             Write-Host "  AppIDSvc Start: $appIdStart -> 4 (Disabled)" -ForegroundColor Cyan
             Set-ItemProperty-Logged -Path $appIdPath -Name Start -Value 4 -Type DWord -Force
-        } elseif (-not (Test-Path $appIdPath)) {
+        }
+        elseif (-not (Test-Path $appIdPath)) {
             Write-Host "  AppIDSvc registry key not found - service not installed on this image." -ForegroundColor DarkGray
         }
 
         Write-Host "AppLocker enforcement disabled." -ForegroundColor Green
         Write-Host ("  NOTE: AppLocker rules are preserved (EnforcementMode=0). " +
-                    "To re-enable, set EnforcementMode=1 under SOFTWARE\Policies\Microsoft\Windows\SrpV2\<Collection> " +
-                    "and set AppIDSvc Start back to 2 (Automatic) on the live VM.") -ForegroundColor Cyan
+            "To re-enable, set EnforcementMode=1 under SOFTWARE\Policies\Microsoft\Windows\SrpV2\<Collection> " +
+            "and set AppIDSvc Start back to 2 (Automatic) on the live VM.") -ForegroundColor Cyan
         Write-Warning ("If AppLocker policy is delivered by Intune/MDM, the offline registry path will be empty " +
-                       "and policy will reapply on next MDM sync. Resolve via Intune before starting the VM.")
-    }
-    catch {
-        Write-Error "DisableAppLocker failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-        UnmountOffHive -Hive "SOFTWARE"
+            "and policy will reapply on next MDM sync. Resolve via Intune before starting the VM.")
     }
 }
 
 function FixSanPolicy {
     Write-Host "Setting SAN policy to OnlineAll so all disks come online on boot..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
-        $sanPath    = "$SystemRoot\Services\partmgr\Parameters"
+        $sanPath = "$SystemRoot\Services\partmgr\Parameters"
 
         $before = (Get-ItemProperty $sanPath -ErrorAction SilentlyContinue).SanPolicy
         Set-ItemProperty-Logged -Path $sanPath -Name SanPolicy -Value 1 -Type DWord -Force  # 1 = OnlineAll
@@ -2684,25 +2532,16 @@ function FixSanPolicy {
         Write-Host "SAN policy set to OnlineAll (1). Previous value: $(if ($null -ne $before) { $before } else { 'not set' })." -ForegroundColor Green
         Write-Host "Revert: Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\partmgr\Parameters' -Name SanPolicy -Value $(if ($null -ne $before) { $before } else { 4 }) -Type DWord -Force" -ForegroundColor DarkCyan
     }
-    catch {
-        Write-Error "FixSanPolicy failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 function FixAzureGuestAgent {
     Write-Host "Enabling Azure Guest Agent and RdAgent services..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
 
         $agents = @(
             @{ Name = 'WindowsAzureGuestAgent'; StartValue = 2 },
-            @{ Name = 'RdAgent';                StartValue = 2 },
+            @{ Name = 'RdAgent'; StartValue = 2 },
             @{ Name = 'WindowsAzureTelemetryService'; StartValue = 3 }
         )
 
@@ -2718,13 +2557,6 @@ function FixAzureGuestAgent {
             }
         }
         Write-Host "Azure Guest Agent services configured. Boot the VM for them to start." -ForegroundColor Green
-    }
-    catch {
-        Write-Error "FixAzureGuestAgent failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -2750,8 +2582,8 @@ function InstallAzureVMAgentOffline {
         $hostKey = "HKLM:\SYSTEM\ControlSet001\Services\$svc"
         if (-not (Test-Path $hostKey)) {
             Write-Error ("SKIPPED: Host registry key '$hostKey' not found. " +
-                         "Azure VM Agent must be installed on this Hyper-V rescue VM to use -InstallAzureVMAgent. " +
-                         "Download and install the agent from https://aka.ms/vmagentwin first.")
+                "Azure VM Agent must be installed on this Hyper-V rescue VM to use -InstallAzureVMAgent. " +
+                "Download and install the agent from https://aka.ms/vmagentwin first.")
             return
         }
     }
@@ -2759,23 +2591,24 @@ function InstallAzureVMAgentOffline {
     $hostWaFolder = 'C:\WindowsAzure'
     if (-not (Test-Path $hostWaFolder)) {
         Write-Error ("SKIPPED: '$hostWaFolder' not found on this host. " +
-                     "Azure VM Agent must be installed on this Hyper-V rescue VM to use -InstallAzureVMAgent.")
+            "Azure VM Agent must be installed on this Hyper-V rescue VM to use -InstallAzureVMAgent.")
         return
     }
 
     $agentFolders = Get-ChildItem -Path $hostWaFolder -Directory -Filter 'GuestAgent_*' -ErrorAction SilentlyContinue |
-                    Sort-Object Name
+    Sort-Object Name
     if (-not $agentFolders) {
         # Fallback: check ImagePath in the host registry to find the folder
         $imgPath = (Get-ItemProperty 'HKLM:\SYSTEM\ControlSet001\Services\WindowsAzureGuestAgent' `
-                        -ErrorAction SilentlyContinue).ImagePath
-        $imgDir  = if ($imgPath) { Split-Path $imgPath -Parent } else { $null }
+                -ErrorAction SilentlyContinue).ImagePath
+        $imgDir = if ($imgPath) { Split-Path $imgPath -Parent } else { $null }
         if ($imgDir -and (Test-Path $imgDir)) {
             Write-Host "  No GuestAgent_* folder found; using ImagePath directory: $imgDir" -ForegroundColor Cyan
             $agentFolders = @(Get-Item $imgDir)
-        } else {
+        }
+        else {
             Write-Error ("SKIPPED: No GuestAgent_* folders found under '$hostWaFolder' and ImagePath resolution failed. " +
-                         "Cannot copy agent binaries to the offline disk.")
+                "Cannot copy agent binaries to the offline disk.")
             return
         }
     }
@@ -2803,15 +2636,13 @@ function InstallAzureVMAgentOffline {
     # ------------------------------------------------------------------
     # Step 4 + 5: Import service registry keys into the offline SYSTEM hive
     # ------------------------------------------------------------------
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter 'Windows'
-    MountOffHive -WinPath $OfflineWindowsPath -Hive 'SYSTEM'
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $currentSet = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue).Current
-        $csName     = if ($currentSet) { 'ControlSet{0:d3}' -f $currentSet } else { 'ControlSet001' }
+        $csName = if ($currentSet) { 'ControlSet{0:d3}' -f $currentSet } else { 'ControlSet001' }
 
         foreach ($svc in $requiredSvcs) {
-            $srcReg  = "HKLM\SYSTEM\ControlSet001\Services\$svc"
-            $dstReg  = "HKLM\BROKENSYSTEM\$csName\Services\$svc"
+            $srcReg = "HKLM\SYSTEM\ControlSet001\Services\$svc"
+            $dstReg = "HKLM\BROKENSYSTEM\$csName\Services\$svc"
 
             Write-Host "  Copying registry: $svc -> offline $csName..." -ForegroundColor Cyan
             $out = reg.exe copy $srcReg $dstReg /s /f 2>&1
@@ -2851,13 +2682,6 @@ function InstallAzureVMAgentOffline {
         Write-Host "  Registry keys  : BROKENSYSTEM\$csName\Services\{WindowsAzureGuestAgent,RdAgent}" -ForegroundColor Green
         Write-Host "  After booting the VM, verify the agent with: Get-Service WindowsAzureGuestAgent" -ForegroundColor Cyan
     }
-    catch {
-        Write-Error "InstallAzureVMAgentOffline failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive 'SYSTEM'
-    }
 }
 
 function FixDeviceClassFilters {
@@ -2893,12 +2717,10 @@ function FixDeviceClassFilters {
     if ($KeepDefaultFilters) {
         Write-Host "  Mode: strict (-KeepDefaultFilters) - only inbox safe-list entries will be kept; Microsoft-signed non-defaults will be removed." -ForegroundColor Cyan
     }
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $currentSet = (Get-ItemProperty "HKLM:\BROKENSYSTEM\Select" -ErrorAction SilentlyContinue).Current
-        $csName     = if ($currentSet) { "ControlSet{0:d3}" -f $currentSet } else { "ControlSet001" }
-        $classRoot  = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
+        $csName = if ($currentSet) { "ControlSet{0:d3}" -f $currentSet } else { "ControlSet001" }
+        $classRoot = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
 
         # Class definitions.
         # SafeFilters  : Known Windows inbox / Azure-expected filter names (case-insensitive). Always kept.
@@ -2915,7 +2737,7 @@ function FixDeviceClassFilters {
                 # storqosflt  - Storage QoS filter (Azure)
                 # wcifs       - Windows Container Isolation
                 # ehstorclass - Enhanced Storage class filter (Microsoft)
-                SafeFilters  = [string[]]@('partmgr','fvevol','iorate','storqosflt','wcifs','ehstorclass')
+                SafeFilters  = [string[]]@('partmgr', 'fvevol', 'iorate', 'storqosflt', 'wcifs', 'ehstorclass')
                 AllowVendors = [string[]]@()
             },
             [PSCustomObject]@{
@@ -2924,7 +2746,7 @@ function FixDeviceClassFilters {
                 Risk         = 'CRITICAL'
                 Description  = 'Extra filters on SCSI/RAID adapters cause stop error 0x7B (INACCESSIBLE_BOOT_DEVICE)'
                 # iasf / iastorf - Intel RST RAID filter (expected on some guest SKUs)
-                SafeFilters  = [string[]]@('iasf','iastorf')
+                SafeFilters  = [string[]]@('iasf', 'iastorf')
                 AllowVendors = [string[]]@()
             },
             [PSCustomObject]@{
@@ -2946,7 +2768,7 @@ function FixDeviceClassFilters {
                 # spldr      - Security processor loader
                 # volmgrx    - Volume manager extension
                 # iorate / storqosflt - Azure storage filters
-                SafeFilters  = [string[]]@('volsnap','fvevol','rdyboost','spldr','volmgrx','iorate','storqosflt')
+                SafeFilters  = [string[]]@('volsnap', 'fvevol', 'rdyboost', 'spldr', 'volmgrx', 'iorate', 'storqosflt')
                 AllowVendors = [string[]]@()
             },
             [PSCustomObject]@{
@@ -2962,10 +2784,10 @@ function FixDeviceClassFilters {
                 # mslldp                 - Microsoft LLDP Protocol Driver
                 # psched                 - QoS Packet Scheduler
                 # bridge                 - Network Bridge
-                SafeFilters  = [string[]]@('wfplwf','ndiscap','ndisimplatformmpfilter','vmsproxyhnicfilter','vms3cap','mslldp','psched','bridge')
+                SafeFilters  = [string[]]@('wfplwf', 'ndiscap', 'ndisimplatformmpfilter', 'vmsproxyhnicfilter', 'vms3cap', 'mslldp', 'psched', 'bridge')
                 # Mellanox: Azure VMs use Mellanox ConnectX VF / MANA network adapters.
                 # NVIDIA acquired Mellanox; some binaries show either company name.
-                AllowVendors = [string[]]@('Mellanox','NVIDIA')
+                AllowVendors = [string[]]@('Mellanox', 'NVIDIA')
             }
         )
 
@@ -3008,22 +2830,17 @@ function FixDeviceClassFilters {
                     Write-Host "    $filterType (host ref): $($hostFilters -join ', ')" -ForegroundColor DarkGray
                 }
 
-                $toKeep  = [System.Collections.Generic.List[string]]::new()
+                $toKeep = [System.Collections.Generic.List[string]]::new()
                 $removed = [System.Collections.Generic.List[string]]::new()
 
                 foreach ($filter in $currentFilters) {
                     # Resolve the binary path for all checks
-                    $svcRegPath  = "HKLM:\BROKENSYSTEM\$csName\Services\$filter"
-                    $imgPathRaw  = (Get-ItemProperty $svcRegPath -ErrorAction SilentlyContinue).ImagePath
+                    $svcRegPath = "HKLM:\BROKENSYSTEM\$csName\Services\$filter"
+                    $imgPathRaw = (Get-ItemProperty $svcRegPath -ErrorAction SilentlyContinue).ImagePath
                     $imgResolved = $null
-                    $company     = $null
+                    $company = $null
                     if ($imgPathRaw) {
-                        $imgResolved = $imgPathRaw `
-                            -replace '(?i)\\SystemRoot\\',  "$script:WinDriveLetter\Windows\" `
-                            -replace '(?i)%SystemRoot%',    "$script:WinDriveLetter\Windows" `
-                            -replace '(?i)\\\?\?\\',       '' `
-                            -replace '(?i)^system32\\',    "$script:WinDriveLetter\Windows\System32\\"
-                        if ($imgResolved -match '^(.+?\.(?:sys|exe))') { $imgResolved = $Matches[1] }
+                        $imgResolved = Resolve-GuestImagePath $imgPathRaw
                         if (Test-Path $imgResolved) {
                             $company = (Get-Item $imgResolved -ErrorAction SilentlyContinue).VersionInfo.CompanyName
                         }
@@ -3064,17 +2881,19 @@ function FixDeviceClassFilters {
 
                     # Priority 4: binary company name matches an allowed vendor (skipped in strict mode)
                     $isMicrosoftBinary = $company -match 'Microsoft'
-                    $isAllowedVendor   = $classDef.AllowVendors | Where-Object { $_ -and $company -match $_ }
+                    $isAllowedVendor = $classDef.AllowVendors | Where-Object { $_ -and $company -match $_ }
 
                     if (-not $KeepDefaultFilters -and ($isMicrosoftBinary -or $isAllowedVendor)) {
                         $toKeep.Add($filter)
                         Write-Host "      [KEEP  ] $filter - company: '$company'" -ForegroundColor Green
-                    } else {
+                    }
+                    else {
                         # Remove: either strict mode (non-safe-list) or non-Microsoft third-party
                         $vendorInfo = if ($company) { "company: '$company'" } else { 'no version info' }
                         $removeReason = if ($KeepDefaultFilters -and ($isMicrosoftBinary -or $isAllowedVendor)) {
                             "not in safe-list (strict mode)"
-                        } else {
+                        }
+                        else {
                             "non-Microsoft third-party filter ($vendorInfo)"
                         }
                         Write-Host "      [REMOVE] $filter - $removeReason" -ForegroundColor $riskColor
@@ -3096,7 +2915,8 @@ function FixDeviceClassFilters {
                     if ($toKeep.Count -gt 0) {
                         Set-ItemProperty-Logged -Path $classPath -Name $filterType `
                             -Value ([string[]]$toKeep) -Type MultiString -Force
-                    } else {
+                    }
+                    else {
                         # No entries remain - remove the value entirely rather than leaving an empty MultiString
                         Remove-ItemProperty-Logged -Path $classPath -Name $filterType -Force
                     }
@@ -3108,17 +2928,11 @@ function FixDeviceClassFilters {
         if ($anyChanges) {
             Write-Host "`nDevice class filter cleanup complete." -ForegroundColor Green
             Write-Warning ("If a legitimate product (backup agent, endpoint security, storage appliance) " +
-                           "requires a removed filter, restore it from the action log and re-evaluate.")
-        } else {
+                "requires a removed filter, restore it from the action log and re-evaluate.")
+        }
+        else {
             Write-Host "`nNo unsafe device class filters found. No changes made." -ForegroundColor Green
         }
-    }
-    catch {
-        Write-Error "FixDeviceClassFilters failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -3130,28 +2944,27 @@ function ScanNetAdapterBindings {
     #   Get-NetAdapterBinding -AllBindings -IncludeHidden | Where ComponentID -notmatch '^ms_'
 
     Write-Host "Scanning offline disk for third-party network binding components..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
-        $currentSet = (Get-ItemProperty "HKLM:\BROKENSYSTEM\Select" -ErrorAction SilentlyContinue).Current
-        $csName     = if ($currentSet) { "ControlSet{0:d3}" -f $currentSet } else { "ControlSet001" }
+    Invoke-WithHive 'SYSTEM' {
+        & {
+            $currentSet = (Get-ItemProperty "HKLM:\BROKENSYSTEM\Select" -ErrorAction SilentlyContinue).Current
+            $csName = if ($currentSet) { "ControlSet{0:d3}" -f $currentSet } else { "ControlSet001" }
 
-        # ── Adapter inventory ────────────────────────────────────────────────────
-        # Friendly-name lookup: {GUID} -> adapter name (e.g. "Ethernet")
-        $adapterNames = @{}
-        $netNetKey = "HKLM:\BROKENSYSTEM\$csName\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}"
-        if (Test-Path $netNetKey) {
-            Get-ChildItem $netNetKey -ErrorAction SilentlyContinue | ForEach-Object {
-                $connName = (Get-ItemProperty "$($_.PSPath)\Connection" -ErrorAction SilentlyContinue).Name
-                if ($connName) { $adapterNames[$_.PSChildName.ToUpper()] = $connName }
+            # ── Adapter inventory ────────────────────────────────────────────────────
+            # Friendly-name lookup: {GUID} -> adapter name (e.g. "Ethernet")
+            $adapterNames = @{}
+            $netNetKey = "HKLM:\BROKENSYSTEM\$csName\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+            if (Test-Path $netNetKey) {
+                Get-ChildItem $netNetKey -ErrorAction SilentlyContinue | ForEach-Object {
+                    $connName = (Get-ItemProperty "$($_.PSPath)\Connection" -ErrorAction SilentlyContinue).Name
+                    if ($connName) { $adapterNames[$_.PSChildName.ToUpper()] = $connName }
+                }
             }
-        }
 
-        # Hardware-description lookup: {GUID} -> DriverDesc (e.g. "Mellanox VF")
-        $adapterDescs = @{}
-        $netClassKey = "HKLM:\BROKENSYSTEM\$csName\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}"
-        if (Test-Path $netClassKey) {
-            Get-ChildItem $netClassKey -ErrorAction SilentlyContinue |
+            # Hardware-description lookup: {GUID} -> DriverDesc (e.g. "Mellanox VF")
+            $adapterDescs = @{}
+            $netClassKey = "HKLM:\BROKENSYSTEM\$csName\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+            if (Test-Path $netClassKey) {
+                Get-ChildItem $netClassKey -ErrorAction SilentlyContinue |
                 Where-Object { $_.PSChildName -match '^\d{4}$' } |
                 ForEach-Object {
                     $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
@@ -3159,41 +2972,42 @@ function ScanNetAdapterBindings {
                         $adapterDescs[$p.NetCfgInstanceId.ToUpper()] = $p.DriverDesc
                     }
                 }
-        }
-
-        # Print adapter table
-        Write-Host "`nNetwork adapters found in offline disk:" -ForegroundColor Cyan
-        $adapterRows = foreach ($guid in ($adapterDescs.Keys | Sort-Object)) {
-            $friendlyGuid = $guid   # already upper, with braces or without - normalise
-            $cleanGuid = $friendlyGuid.Trim('{','}')
-            [PSCustomObject]@{
-                FriendlyName = $adapterNames[$cleanGuid]
-                Description  = $adapterDescs[$guid]
-                GUID         = "{$cleanGuid}"
             }
-        }
-        if ($adapterRows) {
-            $adapterRows | Format-Table FriendlyName, Description, GUID -AutoSize | Out-String | Write-Host
-        } else {
-            Write-Host "  (none found)" -ForegroundColor DarkGray
-        }
 
-        # ── Component enumeration ─────────────────────────────────────────────────
-        # Network protocol/service/client software components each live under a
-        # numbered instance key inside their Class GUID.
-        $componentClasses = @(
-            [PSCustomObject]@{ GUID = '{4D36E973-E325-11CE-BFC1-08002BE10318}'; Type = 'Client'   }
-            [PSCustomObject]@{ GUID = '{4D36E974-E325-11CE-BFC1-08002BE10318}'; Type = 'Service'  }
-            [PSCustomObject]@{ GUID = '{4D36E975-E325-11CE-BFC1-08002BE10318}'; Type = 'Protocol' }
-        )
+            # Print adapter table
+            Write-Host "`nNetwork adapters found in offline disk:" -ForegroundColor Cyan
+            $adapterRows = foreach ($guid in ($adapterDescs.Keys | Sort-Object)) {
+                $friendlyGuid = $guid   # already upper, with braces or without - normalise
+                $cleanGuid = $friendlyGuid.Trim('{', '}')
+                [PSCustomObject]@{
+                    FriendlyName = $adapterNames[$cleanGuid]
+                    Description  = $adapterDescs[$guid]
+                    GUID         = "{$cleanGuid}"
+                }
+            }
+            if ($adapterRows) {
+                $adapterRows | Format-Table FriendlyName, Description, GUID -AutoSize | Out-String | Write-Host
+            }
+            else {
+                Write-Host "  (none found)" -ForegroundColor DarkGray
+            }
 
-        $allComponents = [System.Collections.Generic.List[PSCustomObject]]::new()
+            # ── Component enumeration ─────────────────────────────────────────────────
+            # Network protocol/service/client software components each live under a
+            # numbered instance key inside their Class GUID.
+            $componentClasses = @(
+                [PSCustomObject]@{ GUID = '{4D36E973-E325-11CE-BFC1-08002BE10318}'; Type = 'Client' }
+                [PSCustomObject]@{ GUID = '{4D36E974-E325-11CE-BFC1-08002BE10318}'; Type = 'Service' }
+                [PSCustomObject]@{ GUID = '{4D36E975-E325-11CE-BFC1-08002BE10318}'; Type = 'Protocol' }
+            )
 
-        foreach ($classInfo in $componentClasses) {
-            $classKey = "HKLM:\BROKENSYSTEM\$csName\Control\Class\$($classInfo.GUID)"
-            if (-not (Test-Path $classKey)) { continue }
+            $allComponents = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-            Get-ChildItem $classKey -ErrorAction SilentlyContinue |
+            foreach ($classInfo in $componentClasses) {
+                $classKey = "HKLM:\BROKENSYSTEM\$csName\Control\Class\$($classInfo.GUID)"
+                if (-not (Test-Path $classKey)) { continue }
+
+                Get-ChildItem $classKey -ErrorAction SilentlyContinue |
                 Where-Object { $_.PSChildName -match '^\d{4}$' } |
                 ForEach-Object {
                     $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
@@ -3203,20 +3017,20 @@ function ScanNetAdapterBindings {
                     if (-not $componentId) { return }
 
                     # Service name: prefer explicit Ndi\Service, fall back to stripping 'ms_' prefix
-                    $ndiProps    = Get-ItemProperty "$($_.PSPath)\Ndi" -ErrorAction SilentlyContinue
+                    $ndiProps = Get-ItemProperty "$($_.PSPath)\Ndi" -ErrorAction SilentlyContinue
                     $serviceName = if ($ndiProps -and $ndiProps.Service) { $ndiProps.Service }
-                                   else { $componentId -replace '^ms_', '' }
+                    else { $componentId -replace '^ms_', '' }
 
                     # Bound-adapter list from Services\<svc>\Linkage\Bind
-                    $boundAdapters   = @()
-                    $linkagePath     = "HKLM:\BROKENSYSTEM\$csName\Services\$serviceName\Linkage"
+                    $boundAdapters = @()
+                    $linkagePath = "HKLM:\BROKENSYSTEM\$csName\Services\$serviceName\Linkage"
                     if (Test-Path $linkagePath) {
-                        $linkage      = Get-ItemProperty $linkagePath -ErrorAction SilentlyContinue
+                        $linkage = Get-ItemProperty $linkagePath -ErrorAction SilentlyContinue
                         $disabledList = @($linkage.Disabled | Where-Object { $_ })
                         foreach ($b in @($linkage.Bind | Where-Object { $_ })) {
                             # Bind entries look like: \Device\{GUID} or \Device\{GUID}_N
                             if ($b -match '\{([0-9A-Fa-f\-]+)\}') {
-                                $g    = $Matches[1].ToUpper()
+                                $g = $Matches[1].ToUpper()
                                 $name = $adapterNames[$g]
                                 $desc = $adapterDescs["{$g}"]
                                 $label = if ($name) { $name } elseif ($desc) { $desc } else { "{$g}" }
@@ -3226,87 +3040,80 @@ function ScanNetAdapterBindings {
                     }
 
                     # Binary presence on the offline disk
-                    $imgPathRaw  = (Get-ItemProperty "HKLM:\BROKENSYSTEM\$csName\Services\$serviceName" -ErrorAction SilentlyContinue).ImagePath
+                    $imgPathRaw = (Get-ItemProperty "HKLM:\BROKENSYSTEM\$csName\Services\$serviceName" -ErrorAction SilentlyContinue).ImagePath
                     $binaryFound = $null
                     if ($imgPathRaw) {
-                        $imgResolved = $imgPathRaw `
-                            -replace '(?i)\\SystemRoot\\', "$script:WinDriveLetter\Windows\" `
-                            -replace '(?i)%SystemRoot%',   "$script:WinDriveLetter\Windows" `
-                            -replace '(?i)\\\?\?\\',      '' `
-                            -replace '(?i)^system32\\',   "$script:WinDriveLetter\Windows\System32\\"
-                        if ($imgResolved -match '^(.+?\.(?:sys|exe|dll))') { $imgResolved = $Matches[1] }
+                        $imgResolved = Resolve-GuestImagePath $imgPathRaw
                         $binaryFound = Test-Path $imgResolved
                     }
 
                     $allComponents.Add([PSCustomObject]@{
-                        ComponentId   = $componentId
-                        Type          = $classInfo.Type
-                        DisplayName   = $props.DriverDesc
-                        ServiceName   = $serviceName
-                        IsThirdParty  = ($componentId -notmatch '^ms_')
-                        BoundAdapters = ($boundAdapters -join '; ')
-                        BinaryFound   = $binaryFound
-                    })
+                            ComponentId   = $componentId
+                            Type          = $classInfo.Type
+                            DisplayName   = $props.DriverDesc
+                            ServiceName   = $serviceName
+                            IsThirdParty  = ($componentId -notmatch '^ms_')
+                            BoundAdapters = ($boundAdapters -join '; ')
+                            BinaryFound   = $binaryFound
+                        })
                 }
-        }
-
-        # Deduplicate in case the same ComponentId appears in multiple class GUIDs
-        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        $components = $allComponents | Where-Object { $seen.Add($_.ComponentId) }
-
-        $firstParty = @($components | Where-Object { -not $_.IsThirdParty })
-        $thirdParty = @($components | Where-Object { $_.IsThirdParty } | Sort-Object ComponentId)
-
-        # ── Report ────────────────────────────────────────────────────────────────
-        Write-Host "First-party binding components (ms_*): $($firstParty.Count)" -ForegroundColor DarkGray
-
-        if ($thirdParty.Count -eq 0) {
-            Write-Host "`nNo third-party network binding components found." -ForegroundColor Green
-        } else {
-            Write-Host "`nThird-party network binding components: $($thirdParty.Count)" -ForegroundColor Yellow
-            Write-Host "  ComponentId does not start with 'ms_' - these extend the network stack at boot." -ForegroundColor DarkYellow
-            Write-Host ""
-
-            foreach ($c in $thirdParty) {
-                if ($c.BinaryFound -eq $false) {
-                    $presenceTag = 'BINARY MISSING'
-                    $color       = 'Red'
-                } elseif ($c.BinaryFound -eq $true) {
-                    $presenceTag = 'binary present'
-                    $color       = 'Yellow'
-                } else {
-                    $presenceTag = 'no ImagePath registered'
-                    $color       = 'DarkYellow'
-                }
-
-                Write-Host "  [$($c.Type.PadRight(8))] $($c.ComponentId.PadRight(32)) $($c.DisplayName)" -ForegroundColor $color
-                Write-Host "             Service : $($c.ServiceName)  |  $presenceTag" -ForegroundColor $color
-                if ($c.BoundAdapters) {
-                    Write-Host "             Bound to: $($c.BoundAdapters)" -ForegroundColor DarkYellow
-                } else {
-                    Write-Host "             Bound to: (linkage not cached offline - resolved at boot)" -ForegroundColor DarkGray
-                }
-                Write-Host ""
             }
 
-            Write-Warning ("Third-party network components extend the network stack. " +
-                           "If the VM has no network connectivity after boot, these components " +
-                           "may be interfering. Use -FixDeviceFilters to scan NDIS UpperFilters/LowerFilters.")
-        }
+            # Deduplicate in case the same ComponentId appears in multiple class GUIDs
+            $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $components = $allComponents | Where-Object { $seen.Add($_.ComponentId) }
 
-        Write-ActionLog -Event 'ScanNetAdapterBindings' -Details @{
-            AdapterCount    = $adapterRows.Count
-            FirstPartyCount = $firstParty.Count
-            ThirdPartyCount = $thirdParty.Count
-            ThirdPartyIds   = ($thirdParty | ForEach-Object ComponentId) -join ', '
+            $firstParty = @($components | Where-Object { -not $_.IsThirdParty })
+            $thirdParty = @($components | Where-Object { $_.IsThirdParty } | Sort-Object ComponentId)
+
+            # ── Report ────────────────────────────────────────────────────────────────
+            Write-Host "First-party binding components (ms_*): $($firstParty.Count)" -ForegroundColor DarkGray
+
+            if ($thirdParty.Count -eq 0) {
+                Write-Host "`nNo third-party network binding components found." -ForegroundColor Green
+            }
+            else {
+                Write-Host "`nThird-party network binding components: $($thirdParty.Count)" -ForegroundColor Yellow
+                Write-Host "  ComponentId does not start with 'ms_' - these extend the network stack at boot." -ForegroundColor DarkYellow
+                Write-Host ""
+
+                foreach ($c in $thirdParty) {
+                    if ($c.BinaryFound -eq $false) {
+                        $presenceTag = 'BINARY MISSING'
+                        $color = 'Red'
+                    }
+                    elseif ($c.BinaryFound -eq $true) {
+                        $presenceTag = 'binary present'
+                        $color = 'Yellow'
+                    }
+                    else {
+                        $presenceTag = 'no ImagePath registered'
+                        $color = 'DarkYellow'
+                    }
+
+                    Write-Host "  [$($c.Type.PadRight(8))] $($c.ComponentId.PadRight(32)) $($c.DisplayName)" -ForegroundColor $color
+                    Write-Host "             Service : $($c.ServiceName)  |  $presenceTag" -ForegroundColor $color
+                    if ($c.BoundAdapters) {
+                        Write-Host "             Bound to: $($c.BoundAdapters)" -ForegroundColor DarkYellow
+                    }
+                    else {
+                        Write-Host "             Bound to: (linkage not cached offline - resolved at boot)" -ForegroundColor DarkGray
+                    }
+                    Write-Host ""
+                }
+
+                Write-Warning ("Third-party network components extend the network stack. " +
+                    "If the VM has no network connectivity after boot, these components " +
+                    "may be interfering. Use -FixDeviceFilters to scan NDIS UpperFilters/LowerFilters.")
+            }
+
+            Write-ActionLog -Event 'ScanNetAdapterBindings' -Details @{
+                AdapterCount    = $adapterRows.Count
+                FirstPartyCount = $firstParty.Count
+                ThirdPartyCount = $thirdParty.Count
+                ThirdPartyIds   = ($thirdParty | ForEach-Object ComponentId) -join ', '
+            }
         }
-    }
-    catch {
-        Write-Error "ScanNetAdapterBindings failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -3325,30 +3132,29 @@ function RemoveOrphanedNetBindings {
     #   3. Clears Services\<svc>\Linkage\{Bind, Export, Route} to detach from all adapters
 
     Write-Host "Scanning for orphaned third-party network binding components (missing binary)..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
-        $currentSet = (Get-ItemProperty "HKLM:\BROKENSYSTEM\Select" -ErrorAction SilentlyContinue).Current
-        $csName     = if ($currentSet) { "ControlSet{0:d3}" -f $currentSet } else { "ControlSet001" }
+    Invoke-WithHive 'SYSTEM' {
+        & {
+            $currentSet = (Get-ItemProperty "HKLM:\BROKENSYSTEM\Select" -ErrorAction SilentlyContinue).Current
+            $csName = if ($currentSet) { "ControlSet{0:d3}" -f $currentSet } else { "ControlSet001" }
 
-        $componentClasses = @(
-            [PSCustomObject]@{ GUID = '{4D36E973-E325-11CE-BFC1-08002BE10318}'; Type = 'Client'   }
-            [PSCustomObject]@{ GUID = '{4D36E974-E325-11CE-BFC1-08002BE10318}'; Type = 'Service'  }
-            [PSCustomObject]@{ GUID = '{4D36E975-E325-11CE-BFC1-08002BE10318}'; Type = 'Protocol' }
-        )
+            $componentClasses = @(
+                [PSCustomObject]@{ GUID = '{4D36E973-E325-11CE-BFC1-08002BE10318}'; Type = 'Client' }
+                [PSCustomObject]@{ GUID = '{4D36E974-E325-11CE-BFC1-08002BE10318}'; Type = 'Service' }
+                [PSCustomObject]@{ GUID = '{4D36E975-E325-11CE-BFC1-08002BE10318}'; Type = 'Protocol' }
+            )
 
-        $orphans = [System.Collections.Generic.List[PSCustomObject]]::new()
-        $seen    = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $orphans = [System.Collections.Generic.List[PSCustomObject]]::new()
+            $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
-        foreach ($classInfo in $componentClasses) {
-            $classKey = "HKLM:\BROKENSYSTEM\$csName\Control\Class\$($classInfo.GUID)"
-            if (-not (Test-Path $classKey)) { continue }
+            foreach ($classInfo in $componentClasses) {
+                $classKey = "HKLM:\BROKENSYSTEM\$csName\Control\Class\$($classInfo.GUID)"
+                if (-not (Test-Path $classKey)) { continue }
 
-            Get-ChildItem $classKey -ErrorAction SilentlyContinue |
+                Get-ChildItem $classKey -ErrorAction SilentlyContinue |
                 Where-Object { $_.PSChildName -match '^\d{4}$' } |
                 ForEach-Object {
-                    $instPath    = $_.PSPath
-                    $props       = Get-ItemProperty $instPath -ErrorAction SilentlyContinue
+                    $instPath = $_.PSPath
+                    $props = Get-ItemProperty $instPath -ErrorAction SilentlyContinue
                     $componentId = if ($props.ComponentId) { $props.ComponentId } else { $props.ComponentID }
                     if (-not $componentId) { return }
                     # Deduplicate across class GUIDs
@@ -3356,96 +3162,87 @@ function RemoveOrphanedNetBindings {
                     # Never touch first-party ms_ components
                     if ($componentId -match '^ms_') { return }
 
-                    $ndiProps    = Get-ItemProperty "$instPath\Ndi" -ErrorAction SilentlyContinue
+                    $ndiProps = Get-ItemProperty "$instPath\Ndi" -ErrorAction SilentlyContinue
                     $serviceName = if ($ndiProps -and $ndiProps.Service) { $ndiProps.Service }
-                                   else { $componentId -replace '^ms_', '' }
+                    else { $componentId -replace '^ms_', '' }
 
                     $imgPathRaw = (Get-ItemProperty "HKLM:\BROKENSYSTEM\$csName\Services\$serviceName" -ErrorAction SilentlyContinue).ImagePath
                     # No ImagePath -> skip; component may be imageless by design
                     if ($null -eq $imgPathRaw) { return }
 
-                    $imgResolved = $imgPathRaw `
-                        -replace '(?i)\\SystemRoot\\', "$script:WinDriveLetter\Windows\" `
-                        -replace '(?i)%SystemRoot%',   "$script:WinDriveLetter\Windows" `
-                        -replace '(?i)\\\?\?\\',      '' `
-                        -replace '(?i)^system32\\',   "$script:WinDriveLetter\Windows\System32\\"
-                    if ($imgResolved -match '^(.+?\.(?:sys|exe|dll))') { $imgResolved = $Matches[1] }
+                    $imgResolved = Resolve-GuestImagePath $imgPathRaw
                     # Binary present -> nothing to do
                     if (Test-Path $imgResolved) { return }
 
                     $orphans.Add([PSCustomObject]@{
-                        ComponentId   = $componentId
-                        Type          = $classInfo.Type
-                        DisplayName   = $props.DriverDesc
-                        ServiceName   = $serviceName
-                        ClassKeyPath  = $instPath
-                        MissingBinary = $imgResolved
-                    })
+                            ComponentId   = $componentId
+                            Type          = $classInfo.Type
+                            DisplayName   = $props.DriverDesc
+                            ServiceName   = $serviceName
+                            ClassKeyPath  = $instPath
+                            MissingBinary = $imgResolved
+                        })
                 }
-        }
-
-        if ($orphans.Count -eq 0) {
-            Write-Host "`nNo orphaned network binding components found. No changes made." -ForegroundColor Green
-            return
-        }
-
-        Write-Host "`nFound $($orphans.Count) orphaned network binding component(s) with missing binaries:" -ForegroundColor Red
-        Write-Host ""
-
-        foreach ($c in $orphans) {
-            Write-Host "  [$($c.Type.PadRight(8))] $($c.ComponentId)  --  $($c.DisplayName)" -ForegroundColor Red
-            Write-Host "             Service : $($c.ServiceName)" -ForegroundColor DarkRed
-            Write-Host "             Missing : $($c.MissingBinary)" -ForegroundColor DarkRed
-            Write-Host ""
-
-            # Step 1: Remove class instance key - de-registers the component from Windows
-            Write-Host "    [1/3] Removing class instance key..." -ForegroundColor Yellow
-            Remove-Item-Logged -Path $c.ClassKeyPath -Recurse -Force
-
-            # Step 2: Disable the service to prevent any load attempt at boot
-            $svcPath = "HKLM:\BROKENSYSTEM\$csName\Services\$($c.ServiceName)"
-            if (Test-Path $svcPath) {
-                Write-Host "    [2/3] Disabling service '$($c.ServiceName)' (Start -> 4)..." -ForegroundColor Yellow
-                Set-ItemProperty-Logged -Path $svcPath -Name Start -Value 4 -Type DWord -Force
-            } else {
-                Write-Host "    [2/3] Service key '$($c.ServiceName)' not found - skipping." -ForegroundColor DarkGray
             }
 
-            # Step 3: Clear Linkage Bind/Export/Route to detach from all adapters
-            $linkPath = "HKLM:\BROKENSYSTEM\$csName\Services\$($c.ServiceName)\Linkage"
-            if (Test-Path $linkPath) {
-                Write-Host "    [3/3] Clearing Linkage bind entries..." -ForegroundColor Yellow
-                foreach ($val in @('Bind', 'Export', 'Route')) {
-                    if ($null -ne (Get-ItemProperty $linkPath -ErrorAction SilentlyContinue).$val) {
-                        Remove-ItemProperty-Logged -Path $linkPath -Name $val -Force
+            if ($orphans.Count -eq 0) {
+                Write-Host "`nNo orphaned network binding components found. No changes made." -ForegroundColor Green
+                return
+            }
+
+            Write-Host "`nFound $($orphans.Count) orphaned network binding component(s) with missing binaries:" -ForegroundColor Red
+            Write-Host ""
+
+            foreach ($c in $orphans) {
+                Write-Host "  [$($c.Type.PadRight(8))] $($c.ComponentId)  --  $($c.DisplayName)" -ForegroundColor Red
+                Write-Host "             Service : $($c.ServiceName)" -ForegroundColor DarkRed
+                Write-Host "             Missing : $($c.MissingBinary)" -ForegroundColor DarkRed
+                Write-Host ""
+
+                # Step 1: Remove class instance key - de-registers the component from Windows
+                Write-Host "    [1/3] Removing class instance key..." -ForegroundColor Yellow
+                Remove-Item-Logged -Path $c.ClassKeyPath -Recurse -Force
+
+                # Step 2: Disable the service to prevent any load attempt at boot
+                $svcPath = "HKLM:\BROKENSYSTEM\$csName\Services\$($c.ServiceName)"
+                if (Test-Path $svcPath) {
+                    Write-Host "    [2/3] Disabling service '$($c.ServiceName)' (Start -> 4)..." -ForegroundColor Yellow
+                    Set-ItemProperty-Logged -Path $svcPath -Name Start -Value 4 -Type DWord -Force
+                }
+                else {
+                    Write-Host "    [2/3] Service key '$($c.ServiceName)' not found - skipping." -ForegroundColor DarkGray
+                }
+
+                # Step 3: Clear Linkage Bind/Export/Route to detach from all adapters
+                $linkPath = "HKLM:\BROKENSYSTEM\$csName\Services\$($c.ServiceName)\Linkage"
+                if (Test-Path $linkPath) {
+                    Write-Host "    [3/3] Clearing Linkage bind entries..." -ForegroundColor Yellow
+                    foreach ($val in @('Bind', 'Export', 'Route')) {
+                        if ($null -ne (Get-ItemProperty $linkPath -ErrorAction SilentlyContinue).$val) {
+                            Remove-ItemProperty-Logged -Path $linkPath -Name $val -Force
+                        }
                     }
                 }
-            } else {
-                Write-Host "    [3/3] No Linkage key found - nothing to clear." -ForegroundColor DarkGray
+                else {
+                    Write-Host "    [3/3] No Linkage key found - nothing to clear." -ForegroundColor DarkGray
+                }
+
+                Write-ActionLog -Event 'OrphanedNetBindingRemoved' -Details @{
+                    ComponentId   = $c.ComponentId
+                    Type          = $c.Type
+                    DisplayName   = $c.DisplayName
+                    ServiceName   = $c.ServiceName
+                    MissingBinary = $c.MissingBinary
+                }
+
+                Write-Host "    Done: $($c.ComponentId) removed." -ForegroundColor Green
+                Write-Host ""
             }
 
-            Write-ActionLog -Event 'OrphanedNetBindingRemoved' -Details @{
-                ComponentId   = $c.ComponentId
-                Type          = $c.Type
-                DisplayName   = $c.DisplayName
-                ServiceName   = $c.ServiceName
-                MissingBinary = $c.MissingBinary
-            }
-
-            Write-Host "    Done: $($c.ComponentId) removed." -ForegroundColor Green
-            Write-Host ""
+            Write-Host "Orphaned network binding cleanup complete. $($orphans.Count) component(s) removed." -ForegroundColor Green
+            Write-Warning ("A full network-stack reset may still be needed. " +
+                "Consider also running -ResetNetworkStack to clear TCP/IP and Winsock state.")
         }
-
-        Write-Host "Orphaned network binding cleanup complete. $($orphans.Count) component(s) removed." -ForegroundColor Green
-        Write-Warning ("A full network-stack reset may still be needed. " +
-                       "Consider also running -ResetNetworkStack to clear TCP/IP and Winsock state.")
-    }
-    catch {
-        Write-Error "RemoveOrphanedNetBindings failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -3459,15 +3256,13 @@ function CopyACPISettings {
 
     Write-Host "Copying Hyper-V ACPI device entries to newer device IDs..." -ForegroundColor Cyan
 
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $sysRoot = Get-SystemRootPath   # e.g. HKLM:\BROKENSYSTEM\ControlSet001
         # Convert PowerShell path to reg.exe syntax (no colon after HKLM)
         $regRoot = $sysRoot -replace '^HKLM:', 'HKLM'
 
         $copies = @(
-            @{ SrcPs = "$sysRoot\Enum\ACPI\VMBus";                  DstPs = "$sysRoot\Enum\ACPI\MSFT1000"; SrcReg = "$regRoot\Enum\ACPI\VMBus";                  DstReg = "$regRoot\Enum\ACPI\MSFT1000"; Label = 'VMBus -> MSFT1000' }
+            @{ SrcPs = "$sysRoot\Enum\ACPI\VMBus"; DstPs = "$sysRoot\Enum\ACPI\MSFT1000"; SrcReg = "$regRoot\Enum\ACPI\VMBus"; DstReg = "$regRoot\Enum\ACPI\MSFT1000"; Label = 'VMBus -> MSFT1000' }
             @{ SrcPs = "$sysRoot\Enum\ACPI\Hyper_V_Gen_Counter_V1"; DstPs = "$sysRoot\Enum\ACPI\MSFT1002"; SrcReg = "$regRoot\Enum\ACPI\Hyper_V_Gen_Counter_V1"; DstReg = "$regRoot\Enum\ACPI\MSFT1002"; Label = 'Hyper_V_Gen_Counter_V1 -> MSFT1002' }
         )
 
@@ -3483,34 +3278,31 @@ function CopyACPISettings {
             if (Test-Path $c.DstPs) {
                 Write-Host "  [OK] Copied $($c.Label)" -ForegroundColor Green
                 $copied++
-            } else {
+            }
+            else {
                 Write-Warning "  reg copy $($c.Label) may have failed - destination key not found after copy"
             }
         }
 
         if ($copied -gt 0) {
             Write-Host "ACPI settings copied ($copied of $($copies.Count) pair(s))." -ForegroundColor Green
-        } else {
+        }
+        else {
             Write-Warning "No ACPI entries were copied - source keys may not exist on this disk."
         }
 
         Write-ActionLog -Event 'CopyACPISettings' -Details @{ RegRoot = $regRoot; Copied = $copied }
-    }
-    catch {
-        Write-Error "CopyACPISettings failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
 function RunSystemCheck {
     # ─────────────────────────────────────────────────────────────────────────
     # Read-only offline health scan. Checks BCD, registry, services, device
-    # filters, networking, RDP, Azure Agent, security settings and crash
-    # artifacts. No changes are made. At the end a prioritised summary is
-    # printed with the exact -Parameter to run for each finding.
+    # filters, networking, RDP, Azure Agent, security settings, crash
+    # artifacts and Gen2 UEFI/Trusted Launch readiness (Secure Boot, vTPM,
+    # VBS/HVCI, BitLocker, EarlyLaunch). No changes are made. At the end a
+    # prioritised summary is printed with the exact -Parameter to run for
+    # each finding.
     # ─────────────────────────────────────────────────────────────────────────
 
     # Reuse guest computer name resolved earlier (stored in $script:GuestComputerName)
@@ -3529,9 +3321,9 @@ function RunSystemCheck {
     # Called as: & $emit 'Category' 'CRIT|WARN|INFO|OK' 'Message' '-FixParam'
     $emit = {
         param([string]$Cat, [string]$Sev, [string]$Desc, [string]$Fix = '')
-        $findings.Add([PSCustomObject]@{ Category=$Cat; Severity=$Sev; Description=$Desc; Fix=$Fix })
-        $color  = switch ($Sev) { 'CRIT' {'Red'} 'WARN' {'Yellow'} 'INFO' {'Cyan'} default {'Green'} }
-        $prefix = switch ($Sev) { 'CRIT' {'[CRIT]'} 'WARN' {'[WARN]'} 'INFO' {'[INFO]'} default {'[ OK ]'} }
+        $findings.Add([PSCustomObject]@{ Category = $Cat; Severity = $Sev; Description = $Desc; Fix = $Fix })
+        $color = switch ($Sev) { 'CRIT' { 'Red' } 'WARN' { 'Yellow' } 'INFO' { 'Cyan' } default { 'Green' } }
+        $prefix = switch ($Sev) { 'CRIT' { '[CRIT]' } 'WARN' { '[WARN]' } 'INFO' { '[INFO]' } default { '[ OK ]' } }
         Write-Host "  $prefix [$Cat] $Desc" -ForegroundColor $color
         if ($Fix) { Write-Host "         Suggestion: $Fix" -ForegroundColor DarkCyan }
     }
@@ -3542,127 +3334,138 @@ function RunSystemCheck {
     # Change a value here to promote or demote any test without touching its logic.
 
     # Disk & Filesystem
-    $sevDiskHealth           = 2   # Disk HealthStatus is not Healthy
-    $sevDiskRawFs            = 2   # Partition has RAW filesystem (unreadable)
-    $sevDiskFsHealth         = 1   # Partition filesystem is unhealthy
+    $sevDiskHealth = 2   # Disk HealthStatus is not Healthy
+    $sevDiskRawFs = 2   # Partition has RAW filesystem (unreadable)
+    $sevDiskFsHealth = 1   # Partition filesystem is unhealthy
 
     # Crash & Boot artefacts
-    $sevCrashMinidumps       = 1   # Minidump (.dmp) files found
-    $sevBootNtbtlog          = 0   # ntbtlog.txt present (check for DIDNOTLOAD)
-    $sevUpdatePendingXml     = 1   # pending.xml found (update boot loop risk)
-    $sevUpdateTxRLogs        = 1   # TxR transaction log files found
-    $sevUpdateSmiLogs        = 1   # SMI Store transaction log files found
-    $sevSetupMode            = 0   # SetupType active (Setup CmdLine will run at boot)
+    $sevCrashMinidumps = 1   # Minidump (.dmp) files found
+    $sevBootNtbtlog = 0   # ntbtlog.txt present (check for DIDNOTLOAD)
+    $sevUpdatePendingXml = 1   # pending.xml found (update boot loop risk)
+    $sevUpdateTxRLogs = 1   # TxR transaction log files found
+    $sevUpdateSmiLogs = 1   # SMI Store transaction log files found
+    $sevSetupMode = 0   # SetupType active (Setup CmdLine will run at boot)
 
     # BCD / Boot Configuration
-    $sevBcdMissing           = 2   # BCD store not found
-    $sevBcdNoBootLoader      = 2   # No Windows Boot Loader entry in BCD
-    $sevBcdSafeMode          = 1   # Safe Mode flag active in BCD
-    $sevBcdBootStatusPolicy  = 0   # bootstatuspolicy IgnoreAllFailures set
-    $sevBcdRecoveryDisabled  = 0   # recoveryenabled Off
-    $sevBcdTestSigning       = 1   # Test signing ON
-    $sevBcdUnknownDevice     = 2   # BCD contains unknown device/path entries
+    $sevBcdMissing = 2   # BCD store not found
+    $sevBcdNoBootLoader = 2   # No Windows Boot Loader entry in BCD
+    $sevBcdSafeMode = 1   # Safe Mode flag active in BCD
+    $sevBcdBootStatusPolicy = 0   # bootstatuspolicy IgnoreAllFailures set
+    $sevBcdRecoveryDisabled = 0   # recoveryenabled Off
+    $sevBcdTestSigning = 1   # Test signing ON
+    $sevBcdUnknownDevice = 2   # BCD contains unknown device/path entries
 
     # Registry
-    $sevControlSetMismatch   = 1   # Current ControlSet != Default
-    $sevRegBackEmpty         = 1   # RegBack\SYSTEM is 0 bytes
-    $sevRegBackMissing       = 0   # RegBack\SYSTEM not found
+    $sevControlSetMismatch = 1   # Current ControlSet != Default
+    $sevRegBackEmpty = 1   # RegBack\SYSTEM is 0 bytes
+    $sevRegBackMissing = 0   # RegBack\SYSTEM not found
 
     # Critical Services
-    $sevCriticalSvcDisabled  = 2   # A critical boot/system driver is disabled
+    $sevCriticalSvcDisabled = 2   # A critical boot/system driver is disabled
 
     # RDP
-    $sevRdpDenied            = 2   # fDenyTSConnections=1 (RDP explicitly disabled)
-    $sevRdpDenyUnknown       = 1   # fDenyTSConnections key missing
-    $sevRdpSvcDisabledCrit   = 2   # TermService/SessionEnv disabled
-    $sevRdpSvcDisabledWarn   = 1   # UmRdpService disabled
-    $sevRdpNonDefaultPort    = 1   # RDP port is not 3389
+    $sevRdpDenied = 2   # fDenyTSConnections=1 (RDP explicitly disabled)
+    $sevRdpDenyUnknown = 1   # fDenyTSConnections key missing
+    $sevRdpSvcDisabledCrit = 2   # TermService/SessionEnv disabled
+    $sevRdpSvcDisabledWarn = 1   # UmRdpService disabled
+    $sevRdpNonDefaultPort = 1   # RDP port is not 3389
     $sevRdpSecurityLayerWeak = 1   # SecurityLayer=0 (RDP native, no SSL)
-    $sevRdpNLADisabled       = 1   # NLA/UserAuthentication disabled
-    $sevRdpSecProtoNeg       = 1   # fAllowSecProtocolNegotiation=0
-    $sevRdpMinEncLevel       = 1   # MinEncryptionLevel below 2
-    $sevRdpTcpKeyMissing     = 1   # RDP-Tcp WinStation key not found
+    $sevRdpNLADisabled = 1   # NLA/UserAuthentication disabled
+    $sevRdpSecProtoNeg = 1   # fAllowSecProtocolNegotiation=0
+    $sevRdpMinEncLevel = 1   # MinEncryptionLevel below 2
+    $sevRdpTcpKeyMissing = 1   # RDP-Tcp WinStation key not found
     $sevRdpCryptoSvcDisabled = 1   # KeyIso/CryptSvc/CertPropSvc disabled
-    $sevRdpTlsDisabled       = 1   # TLS 1.2 explicitly disabled in SCHANNEL
-    $sevRdpNtlmRestrict      = 1   # NTLM restrictions may block RDP auth
-    $sevRdpLmCompat          = 1   # LmCompatibilityLevel > 5
-    $sevCredSspOracle        = 1   # CredSSP AllowEncryptionOracle != 2
-    $sevGpRdpBlocked         = 2   # Group Policy is blocking RDP
-    $sevGpNlaDisabled        = 0   # Group Policy has disabled NLA
-    $sevSslCipherPolicy      = 1   # SSL cipher suite policy configured
-    $sevRdpKeySystemAcl      = 1   # RDP private key: SYSTEM missing FullControl
-    $sevRdpKeyNetSvcAcl      = 1   # RDP private key: NETWORK SERVICE missing Read
-    $sevRdpKeySessionEnvAcl  = 0   # RDP private key: SessionEnv missing FullControl
-    $sevRdpKeyFileMissing    = 1   # RDP private key file not found in MachineKeys
-    $sevRdpKeyZeroLength     = 1   # Zero-length files in MachineKeys
-    $sevMachineKeysMissing   = 1   # MachineKeys folder missing
+    $sevRdpTlsDisabled = 1   # TLS 1.2 explicitly disabled in SCHANNEL
+    $sevRdpNtlmRestrict = 1   # NTLM restrictions may block RDP auth
+    $sevRdpLmCompat = 1   # LmCompatibilityLevel > 5
+    $sevCredSspOracle = 1   # CredSSP AllowEncryptionOracle != 2
+    $sevGpRdpBlocked = 2   # Group Policy is blocking RDP
+    $sevGpNlaDisabled = 0   # Group Policy has disabled NLA
+    $sevSslCipherPolicy = 1   # SSL cipher suite policy configured
+    $sevRdpKeySystemAcl = 1   # RDP private key: SYSTEM missing FullControl
+    $sevRdpKeyNetSvcAcl = 1   # RDP private key: NETWORK SERVICE missing Read
+    $sevRdpKeySessionEnvAcl = 0   # RDP private key: SessionEnv missing FullControl
+    $sevRdpKeyFileMissing = 1   # RDP private key file not found in MachineKeys
+    $sevRdpKeyZeroLength = 1   # Zero-length files in MachineKeys
+    $sevMachineKeysMissing = 1   # MachineKeys folder missing
 
     # Security
-    $sevCredentialGuard      = 1   # Credential Guard is enabled
-    $sevLsaPPL               = 0   # LSA RunAsPPL=1 active
-    $sevAppLockerEnforcing   = 1   # AppLocker is enforcing rules
-    $sevAppIdSvc             = 0   # AppIDSvc (Application Identity) is running
+    $sevCredentialGuard = 1   # Credential Guard is enabled
+    $sevLsaPPL = 0   # LSA RunAsPPL=1 active
+    $sevAppLockerEnforcing = 1   # AppLocker is enforcing rules
+    $sevAppIdSvc = 0   # AppIDSvc (Application Identity) is running
 
     # Azure Guest Agent
-    $sevAzureAgentDisabled   = 2   # Agent service is disabled
+    $sevAzureAgentDisabled = 2   # Agent service is disabled
     $sevAzureAgentWrongStart = 1   # Agent service has unexpected start type
-    $sevAzureAgentMissing    = 1   # Agent not found in registry or on disk
+    $sevAzureAgentMissing = 1   # Agent not found in registry or on disk
 
     # Networking
-    $sevBfeDisabled          = 1   # BFE (Base Filtering Engine) disabled
-    $sevTcpipDisabled        = 2   # Tcpip service disabled
-    $sevNetSvcDisabled       = 1   # Secondary networking services disabled (DNS/DHCP/NLA/SMB)
-    $sevSanPolicy            = 0   # SAN policy is not OnlineAll
-    $sevOrphanedNdis         = 2   # Orphaned NDIS bindings with missing binary
+    $sevBfeDisabled = 1   # BFE (Base Filtering Engine) disabled
+    $sevTcpipDisabled = 2   # Tcpip service disabled
+    $sevNetSvcDisabled = 1   # Secondary networking services disabled (DNS/DHCP/NLA/SMB)
+    $sevSanPolicy = 0   # SAN policy is not OnlineAll
+    $sevOrphanedNdis = 2   # Orphaned NDIS bindings with missing binary
 
     # Drivers
     $sevMissingDriverBinaries = 2  # Boot/System driver registered but binary missing
 
     # Device class filters
-    $sevDeviceFiltersCrit    = 2   # Non-standard entries in DiskDrive/SCSI class filters
-    $sevDeviceFiltersWarn    = 1   # Non-standard entries in Volume/Net class filters
+    $sevDeviceFiltersCrit = 2   # Non-standard entries in DiskDrive/SCSI class filters
+    $sevDeviceFiltersWarn = 1   # Non-standard entries in Volume/Net class filters
 
     # Windows Update
-    $sevUpdateWuDisabled     = 0   # WU services (wuauserv/UsoSvc/WaaSMedicSvc) disabled
-    $sevCbsPendingWarn       = 1   # CBS RebootPending/PackagesPending/exclusive SessionsPending
-    $sevCbsPendingInfo       = 0   # CBS SessionsPending without exclusive lock (stale, usually benign)
+    $sevUpdateWuDisabled = 0   # WU services (wuauserv/UsoSvc/WaaSMedicSvc) disabled
+    $sevCbsPendingWarn = 1   # CBS RebootPending/PackagesPending/exclusive SessionsPending
+    $sevCbsPendingInfo = 0   # CBS SessionsPending without exclusive lock (stale, usually benign)
 
     # ACPI
-    $sevACPISettings         = 0   # Hyper-V ACPI entries (MSFT1000/MSFT1002) missing
+    $sevACPISettings = 0   # Hyper-V ACPI entries (MSFT1000/MSFT1002) missing
 
     # Disk space
-    $sevDiskSpaceLow         = 1   # Volume has less than 10% free space
-    $sevDiskSpaceCritical    = 2   # Volume has less than 500 MB free space
+    $sevDiskSpaceLow = 1   # Volume has less than 10% free space
+    $sevDiskSpaceCritical = 2   # Volume has less than 500 MB free space
 
     # Driver Verifier
-    $sevDriverVerifier       = 2   # Driver Verifier is enabled (will BSOD on any violation)
+    $sevDriverVerifier = 2   # Driver Verifier is enabled (will BSOD on any violation)
 
     # Winlogon
-    $sevWinlogonShell        = 2   # Shell is not explorer.exe (black screen on logon)
-    $sevWinlogonUserinit     = 2   # Userinit is not the default (logon failure)
+    $sevWinlogonShell = 2   # Shell is not explorer.exe (black screen on logon)
+    $sevWinlogonUserinit = 2   # Userinit is not the default (logon failure)
 
     # User Profiles
-    $sevProfileBak           = 1   # ProfileList has .bak duplicate (profile load failure)
-    $sevProfileTempFlag      = 1   # Profile has temporary flag set
+    $sevProfileBak = 1   # ProfileList has .bak duplicate (profile load failure)
+    $sevProfileTempFlag = 1   # Profile has temporary flag set
 
     # Firewall
-    $sevFirewallEnabled      = 0   # Firewall is enabled (normal; INFO only)
-    $sevFirewallRdpBlocked   = 1   # No inbound RDP rule enabled in firewall
+    $sevFirewallEnabled = 0   # Firewall is enabled (normal; INFO only)
+    $sevFirewallRdpBlocked = 1   # No inbound RDP rule enabled in firewall
 
     # Startup Programs
-    $sevStartupPrograms      = 0   # Third-party auto-start programs found
-
-    # Group Policy
-    $sevGpScripts            = 0   # Group Policy scripts folder has startup scripts
+    $sevStartupPrograms = 0   # Third-party auto-start programs found
 
     # Serial Console / EMS
-    $sevEmsDisabled          = 0   # EMS/Serial Console not configured
+    $sevEmsDisabled = 0   # EMS/Serial Console not configured
 
     # Static DNS
-    $sevStaticDns            = 1   # Static DNS servers configured (may break after migration)
+    $sevStaticDns = 1   # Static DNS servers configured (may break after migration)
+
+    # Gen2 / UEFI / Trusted Launch (only evaluated when $script:VMGen -eq 2)
+    $sevBootmgfwMissing = 2   # bootmgfw.efi missing from EFI System Partition
+    $sevBootx64Missing = 1   # EFI\Boot\bootx64.efi fallback loader missing
+    $sevBcdWinloadMismatch = 2   # BCD points to winload.exe on a Gen2 (UEFI) disk
+    $sevBcdNoIntegrityChecks = 2   # nointegritychecks ON - fatal with Secure Boot
+    $sevSecureBootConflict = 2   # testsigning/nointegritychecks ON while guest had Secure Boot
+    $sevSecureBootState = 0   # Secure Boot was previously enabled (informational)
+    $sevDeviceGuardVbs = 0   # VBS is enabled (informational)
+    $sevDeviceGuardPlatReq = 1   # RequirePlatformSecurityFeatures=3 (requires DMA protection)
+    $sevHvciEnabled = 0   # HVCI is enabled (informational)
+    $sevEarlyLaunchPolicy = 1   # EarlyLaunch DriverLoadPolicy is restrictive
+    $sevTpmDriverDisabled = 1   # TPM driver is disabled (vTPM-dependent features will fail)
+    $sevBitLockerActive = 1   # BitLocker FVE active - recovery key needed after disk move
 
     # Inline converter: integer level -> severity string used by $emit
-    $toSev = { param([int]$L) switch ($L) { 0{'INFO'} 1{'WARN'} 2{'CRIT'} default{'INFO'} } }
+    $toSev = { param([int]$L) switch ($L) { 0 { 'INFO' } 1 { 'WARN' } 2 { 'CRIT' } default { 'INFO' } } }
 
     # ── 1. Disk & Filesystem ─────────────────────────────────────────────────
     Write-Host "--- Disk & Filesystem" -ForegroundColor DarkGray
@@ -3671,7 +3474,8 @@ function RunSystemCheck {
         if ($disk) {
             if ($disk.HealthStatus -ne 'Healthy') {
                 & $emit 'Disk' (& $toSev $sevDiskHealth) "Disk health: $($disk.HealthStatus)" "-CheckDiskHealth"
-            } else {
+            }
+            else {
                 & $emit 'Disk' 'OK' "Disk health: Healthy"
             }
         }
@@ -3682,37 +3486,42 @@ function RunSystemCheck {
                 $pLetter = if ($p.DriveLetter -and $p.DriveLetter -ne "`0") { "$($p.DriveLetter):" } else { $script:WinDriveLetter.TrimEnd('\') }
                 if ([string]::IsNullOrEmpty($fs) -or $fs -eq 'Unknown') {
                     & $emit 'Disk' (& $toSev $sevDiskRawFs) "Partition $($p.PartitionNumber) ($pLetter): RAW filesystem - data may be inaccessible" "-FixNTFS -DriveLetter $pLetter -LeaveDiskOnline"
-                } elseif ($vol.HealthStatus -ne 'Healthy') {
+                }
+                elseif ($vol.HealthStatus -ne 'Healthy') {
                     & $emit 'Disk' (& $toSev $sevDiskFsHealth) "Partition $($p.PartitionNumber) ($pLetter) ($fs): health=$($vol.HealthStatus)" "-FixNTFS -DriveLetter $pLetter -LeaveDiskOnline"
                 }
             }
         }
-    } catch { Write-Warning "Disk check failed: $_" }
+    }
+    catch { Write-Warning "Disk check failed: $_" }
 
     # ── 1b. Disk Space (Windows partition only) ──────────────────────────────
     # Only check the Windows partition; small boot/EFI/recovery partitions are expected to be nearly full.
     try {
         $winLetter = $script:WinDriveLetter.TrimEnd('\')
-        $winPart   = Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue |
-                     Where-Object { $_.DriveLetter -and "$($_.DriveLetter):" -eq $winLetter }
+        $winPart = Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriveLetter -and "$($_.DriveLetter):" -eq $winLetter }
         if ($winPart) {
             $vol = Get-Volume -Partition $winPart -ErrorAction SilentlyContinue
             if ($vol -and $vol.Size -gt 0) {
-                $freeGB  = [math]::Round($vol.SizeRemaining / 1GB, 2)
+                $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
                 $totalGB = [math]::Round($vol.Size / 1GB, 2)
                 $freePct = [math]::Round(($vol.SizeRemaining / $vol.Size) * 100, 1)
-                $freeMB  = [math]::Round($vol.SizeRemaining / 1MB, 0)
-                $label   = "Windows partition ($winLetter): $freeGB GB free of $totalGB GB ($freePct%)"
+                $freeMB = [math]::Round($vol.SizeRemaining / 1MB, 0)
+                $label = "Windows partition ($winLetter): $freeGB GB free of $totalGB GB ($freePct%)"
                 if ($freeMB -lt 500) {
                     & $emit 'DiskSpace' (& $toSev $sevDiskSpaceCritical) "$label - CRITICALLY LOW, VM may fail to boot (no space for pagefile/logs)"
-                } elseif ($freePct -lt 10) {
+                }
+                elseif ($freePct -lt 10) {
                     & $emit 'DiskSpace' (& $toSev $sevDiskSpaceLow) "$label - low free space may cause issues"
-                } else {
+                }
+                else {
                     & $emit 'DiskSpace' 'OK' $label
                 }
             }
         }
-    } catch { Write-Warning "Disk space check failed: $_" }
+    }
+    catch { Write-Warning "Disk space check failed: $_" }
 
     # ── 2. Crash & Boot Artefacts ────────────────────────────────────────────
     Write-Host "--- Crash & Boot Artefacts" -ForegroundColor DarkGray
@@ -3722,8 +3531,10 @@ function RunSystemCheck {
         if ($dumps.Count -gt 0) {
             $newest = $dumps | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             & $emit 'Crash' (& $toSev $sevCrashMinidumps) "$($dumps.Count) minidump(s) found - latest: $($newest.Name) [$($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))]" "-CollectEventLogs"
-        } else { & $emit 'Crash' 'OK' 'No minidump files' }
-    } else { & $emit 'Crash' 'OK' 'No Minidump folder' }
+        }
+        else { & $emit 'Crash' 'OK' 'No minidump files' }
+    }
+    else { & $emit 'Crash' 'OK' 'No Minidump folder' }
 
     if (Test-Path (Join-Path $script:WinDriveLetter 'Windows\ntbtlog.txt')) {
         & $emit 'Boot' (& $toSev $sevBootNtbtlog) 'ntbtlog.txt present - check for DIDNOTLOAD entries' "-CollectEventLogs"
@@ -3736,7 +3547,7 @@ function RunSystemCheck {
     # TxR transaction log files (leftover .blf/.regtrans-ms cause stuck update processing)
     $txrFolder = Join-Path $script:WinDriveLetter 'Windows\System32\config\TxR'
     if (Test-Path $txrFolder) {
-        $txrFiles = @(Get-ChildItem $txrFolder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf','.regtrans-ms') })
+        $txrFiles = @(Get-ChildItem $txrFolder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
         if ($txrFiles.Count -gt 0) {
             & $emit 'WindowsUpdate' (& $toSev $sevUpdateTxRLogs) "$($txrFiles.Count) TxR transaction log file(s) found in config\TxR (.blf/.regtrans-ms) - may cause update processing to hang at boot" "-FixPendingUpdates"
         }
@@ -3745,7 +3556,7 @@ function RunSystemCheck {
     # SMI Store transaction files
     $smiFolder = Join-Path $script:WinDriveLetter 'Windows\System32\SMI\Store\Machine'
     if (Test-Path $smiFolder) {
-        $smiFiles = @(Get-ChildItem $smiFolder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf','.regtrans-ms') })
+        $smiFiles = @(Get-ChildItem $smiFolder -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.blf', '.regtrans-ms') })
         if ($smiFiles.Count -gt 0) {
             & $emit 'WindowsUpdate' (& $toSev $sevUpdateSmiLogs) "$($smiFiles.Count) SMI Store transaction log file(s) found (.blf/.regtrans-ms) - may cause update boot loop" "-FixPendingUpdates"
         }
@@ -3756,13 +3567,15 @@ function RunSystemCheck {
     $bcdPath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
     if (-not (Test-Path $bcdPath)) {
         & $emit 'BCD' (& $toSev $sevBcdMissing) "BCD store not found at $bcdPath - VM will fail to boot" "-FixBoot"
-    } else {
+    }
+    else {
         & $emit 'BCD' 'OK' "BCD store present: $bcdPath"
         try {
             $bcdText = (& bcdedit.exe /store "$bcdPath" /enum all 2>&1) | Out-String
             if ($bcdText -notmatch 'Windows Boot Loader|osloader') {
                 & $emit 'BCD' (& $toSev $sevBcdNoBootLoader) 'No Windows Boot Loader entry found in BCD' "-FixBoot"
-            } else {
+            }
+            else {
                 & $emit 'BCD' 'OK' 'Windows Boot Loader entry present'
             }
             if ($bcdText -match 'safeboot\s+(\S+)') {
@@ -3777,419 +3590,543 @@ function RunSystemCheck {
             if ($bcdText -match 'testsigning\s+yes') {
                 & $emit 'BCD' (& $toSev $sevBcdTestSigning) 'Test signing is ON - unsigned drivers are permitted to load' "-DisableTestSigning"
             }
+            if ($bcdText -match 'nointegritychecks\s+yes') {
+                & $emit 'BCD' (& $toSev $sevBcdNoIntegrityChecks) 'nointegritychecks is ON - code integrity checks are bypassed; FATAL if Secure Boot is enabled' "-FixBoot"
+            }
             if ($bcdText -match '\bunknown\b') {
                 & $emit 'BCD' (& $toSev $sevBcdUnknownDevice) 'BCD contains entries with unknown device/path - may point to wrong or missing partition' "-FixBoot"
             }
-        } catch { & $emit 'BCD' 'WARN' "Could not enumerate BCD: $_" }
+            # Gen2 UEFI-specific BCD checks
+            if ($script:VMGen -eq 2) {
+                # winload path mismatch: Gen2 must use winload.efi, not winload.exe
+                if ($bcdText -match 'path\s+.*\\winload\.exe') {
+                    & $emit 'BCD' (& $toSev $sevBcdWinloadMismatch) 'BCD Boot Loader path references winload.exe on a Gen2 (UEFI) disk - must be winload.efi' "-FixBoot"
+                }
+            }
+        }
+        catch { & $emit 'BCD' 'WARN' "Could not enumerate BCD: $_" }
+    }
+
+    # Gen2 UEFI: verify EFI System Partition boot files
+    if ($script:VMGen -eq 2) {
+        $efiBootmgfw = Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi'
+        $efiBootx64 = Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'
+        if (-not (Test-Path $efiBootmgfw)) {
+            & $emit 'BCD' (& $toSev $sevBootmgfwMissing) "bootmgfw.efi missing from EFI System Partition ($efiBootmgfw) - UEFI firmware cannot start Windows Boot Manager" "-FixBoot"
+        }
+        else {
+            & $emit 'BCD' 'OK' 'bootmgfw.efi present on EFI System Partition'
+        }
+        if (-not (Test-Path $efiBootx64)) {
+            & $emit 'BCD' (& $toSev $sevBootx64Missing) "EFI\\Boot\\bootx64.efi fallback loader missing - some UEFI firmware relies on this path" "-FixBoot"
+        }
     }
 
     # ── 4. SYSTEM hive ───────────────────────────────────────────────────────
     Write-Host "--- Registry / Services (SYSTEM hive)" -ForegroundColor DarkGray
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter 'Windows'
-    MountOffHive -WinPath $OfflineWindowsPath -Hive 'SYSTEM'
-    try {
+    Invoke-WithHive 'SYSTEM' {
         # Run all SYSTEM hive checks in a child scope so .NET RegistryKey objects
         # go out of scope (and become GC-collectible) before the finally block
         # calls UnmountOffHive. Without this, cached handles prevent reg.exe unload.
         & {
-        $sel     = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue
-        $curSet  = $sel.Current
-        $lkgcSet = $sel.LastKnownGood
-        $defSet  = $sel.Default
-        $csName  = if ($curSet) { 'ControlSet{0:d3}' -f $curSet } else { 'ControlSet001' }
-        $svcRoot = "HKLM:\BROKENSYSTEM\$csName\Services"
-        $ctrlRoot= "HKLM:\BROKENSYSTEM\$csName\Control"
+            $sel = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue
+            $curSet = $sel.Current
+            $lkgcSet = $sel.LastKnownGood
+            $defSet = $sel.Default
+            $csName = if ($curSet) { 'ControlSet{0:d3}' -f $curSet } else { 'ControlSet001' }
+            $svcRoot = "HKLM:\BROKENSYSTEM\$csName\Services"
+            $ctrlRoot = "HKLM:\BROKENSYSTEM\$csName\Control"
 
-        # ControlSet mismatch
-        if ($null -ne $curSet -and $null -ne $defSet -and $curSet -ne $defSet) {
-            & $emit 'Registry' (& $toSev $sevControlSetMismatch) "ControlSet mismatch: Current=$curSet Default=$defSet - LKGC switch may help" "-TryLGKC"
-        } else {
-            & $emit 'Registry' 'OK' "ControlSet: Current=ControlSet$("{0:d3}" -f $curSet)  LKGC=ControlSet$("{0:d3}" -f $lkgcSet)"
-        }
-
-        # RegBack
-        $rbSystem = Join-Path $script:WinDriveLetter 'Windows\System32\config\RegBack\SYSTEM'
-        if (Test-Path $rbSystem) {
-            $rbSize = (Get-Item $rbSystem).Length
-            if ($rbSize -eq 0) {
-                & $emit 'Registry' (& $toSev $sevRegBackEmpty) 'RegBack\SYSTEM is 0 bytes - no registry backup is available' "-EnableRegBackup"
-            } else {
-                & $emit 'Registry' 'OK' "RegBack\SYSTEM is $([math]::Round($rbSize/1MB, 1)) MB"
+            # ControlSet mismatch
+            if ($null -ne $curSet -and $null -ne $defSet -and $curSet -ne $defSet) {
+                & $emit 'Registry' (& $toSev $sevControlSetMismatch) "ControlSet mismatch: Current=$curSet Default=$defSet - LKGC switch may help" "-TryLGKC"
             }
-        } else {
-            & $emit 'Registry' (& $toSev $sevRegBackMissing) 'RegBack\SYSTEM not found - registry backups not configured' "-EnableRegBackup"
-        }
+            else {
+                & $emit 'Registry' 'OK' "ControlSet: Current=ControlSet$("{0:d3}" -f $curSet)  LKGC=ControlSet$("{0:d3}" -f $lkgcSet)"
+            }
 
-        # Pending Setup CmdLine
-        $setupProps = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Setup' -ErrorAction SilentlyContinue
-        if ($setupProps.SetupType -and $setupProps.SetupType -ne 0) {
-            & $emit 'Boot' (& $toSev $sevSetupMode) "Setup mode active (SetupType=$($setupProps.SetupType)) - VM will run: '$($setupProps.CmdLine)' on next boot"
-        }
-
-        # ── Critical boot services ──────────────────────────────────────────
-        # These disabled = guaranteed BSOD 0x7B or non-boot
-        $critical = @(
-            @{ N='disk';     ExpStart=0; Desc='storage bus driver (0x7B if disabled)' }
-            @{ N='volmgr';   ExpStart=0; Desc='volume manager (0x7B if disabled)' }
-            @{ N='partmgr';  ExpStart=1; Desc='partition manager (0x7B if disabled)' }
-            @{ N='storport'; ExpStart=0; Desc='storage port driver (0x7B if disabled)' }
-            @{ N='NTFS';     ExpStart=1; Desc='NTFS filesystem driver (0x7B if disabled)' }
-            @{ N='volsnap';  ExpStart=1; Desc='volume shadow copy filter' }
-            @{ N='msrpc';    ExpStart=2; Desc='RPC subsystem' }
-            @{ N='rpcss';    ExpStart=2; Desc='RPC Endpoint Mapper' }
-            @{ N='LSM';      ExpStart=2; Desc='Local Session Manager' }
-        )
-        foreach ($s in $critical) {
-            $sp = "$svcRoot\$($s.N)"
-            if (Test-Path $sp) {
-                $start = (Get-ItemProperty $sp -ErrorAction SilentlyContinue).Start
-                if ($start -eq 4) {
-                    & $emit 'Services' (& $toSev $sevCriticalSvcDisabled) "$($s.N) is DISABLED (Start=4) - $($s.Desc) [ re-enable: Set Start=$($s.ExpStart) ]" "-EnableDriverOrService $($s.N)"
+            # RegBack
+            $rbSystem = Join-Path $script:WinDriveLetter 'Windows\System32\config\RegBack\SYSTEM'
+            if (Test-Path $rbSystem) {
+                $rbSize = (Get-Item $rbSystem).Length
+                if ($rbSize -eq 0) {
+                    & $emit 'Registry' (& $toSev $sevRegBackEmpty) 'RegBack\SYSTEM is 0 bytes - no registry backup is available' "-EnableRegBackup"
+                }
+                else {
+                    & $emit 'Registry' 'OK' "RegBack\SYSTEM is $([math]::Round($rbSize/1MB, 1)) MB"
                 }
             }
-        }
-
-        # ── RDP ────────────────────────────────────────────────────────────
-        $tsPath     = "$ctrlRoot\Terminal Server"
-        $rdpTcpPath = "$ctrlRoot\Terminal Server\WinStations\RDP-Tcp"
-        $fDeny = (Get-ItemProperty $tsPath -ErrorAction SilentlyContinue).fDenyTSConnections
-        if ($fDeny -eq 1) {
-            & $emit 'RDP' (& $toSev $sevRdpDenied) 'fDenyTSConnections=1 - RDP is disabled at canonical key' "-FixRDP"
-        } elseif ($null -eq $fDeny) {
-            & $emit 'RDP' (& $toSev $sevRdpDenyUnknown) 'fDenyTSConnections not found - RDP state unclear' "-FixRDP"
-        } else {
-            & $emit 'RDP' 'OK' 'fDenyTSConnections=0 - RDP is enabled'
-        }
-
-        # TermService, SessionEnv, UmRdpService
-        foreach ($rdpSvc in @(
-            @{ N='TermService';  Desc='Remote Desktop Services'; Crit=$true }
-            @{ N='SessionEnv';   Desc='Remote Desktop Config';   Crit=$true }
-            @{ N='UmRdpService'; Desc='RDP UserMode Port Redirector'; Crit=$false }
-        )) {
-            $svcStart = (Get-ItemProperty "$svcRoot\$($rdpSvc.N)" -ErrorAction SilentlyContinue).Start
-            if ($svcStart -eq 4) {
-                $sev = if ($rdpSvc.Crit) { (& $toSev $sevRdpSvcDisabledCrit) } else { (& $toSev $sevRdpSvcDisabledWarn) }
-                & $emit 'RDP' $sev "$($rdpSvc.N) ($($rdpSvc.Desc)) is DISABLED (Start=4) - RDP will not work" "-FixRDP"
-            } elseif ($null -ne $svcStart) {
-                & $emit 'RDP' 'OK' "$($rdpSvc.N) Start=$svcStart"
-            }
-        }
-
-        if (Test-Path $rdpTcpPath) {
-            $rdpP = Get-ItemProperty $rdpTcpPath -ErrorAction SilentlyContinue
-
-            # Port number
-            $rdpPort = $rdpP.PortNumber
-            if ($null -ne $rdpPort -and $rdpPort -ne 3389) {
-                & $emit 'RDP' (& $toSev $sevRdpNonDefaultPort) "RDP-Tcp port is $rdpPort (not the default 3389) - ensure firewall allows this port or run -FixRDP to reset" "-FixRDP"
-            } else {
-                & $emit 'RDP' 'OK' "RDP-Tcp port: $(if ($null -eq $rdpPort) { '(not set, default 3389)' } else { $rdpPort })"
+            else {
+                & $emit 'Registry' (& $toSev $sevRegBackMissing) 'RegBack\SYSTEM not found - registry backups not configured' "-EnableRegBackup"
             }
 
-            # Security layer
-            $sl = $rdpP.SecurityLayer
-            if ($null -ne $sl) {
-                $slDesc = switch ($sl) { 0 {'RDP native (no SSL) - weakest encryption'} 1 {'Negotiate'} 2 {'SSL/TLS required'} default {"Unknown ($sl)"} }
-                $slSev  = if ($sl -eq 0) { (& $toSev $sevRdpSecurityLayerWeak) } else { 'INFO' }
-                & $emit 'RDP' $slSev "SecurityLayer=$sl ($slDesc)"
+            # Pending Setup CmdLine
+            $setupProps = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Setup' -ErrorAction SilentlyContinue
+            if ($setupProps.SetupType -and $setupProps.SetupType -ne 0) {
+                & $emit 'Boot' (& $toSev $sevSetupMode) "Setup mode active (SetupType=$($setupProps.SetupType)) - VM will run: '$($setupProps.CmdLine)' on next boot"
             }
 
-            # NLA / UserAuthentication
-            $ua = $rdpP.UserAuthentication
-            if ($ua -eq 0) {
-                & $emit 'RDP' (& $toSev $sevRdpNLADisabled) 'NLA is DISABLED (UserAuthentication=0) - any user can attempt login without pre-auth; run -EnableNLA to restore' "-EnableNLA"
-            } elseif ($ua -eq 1) {
-                & $emit 'RDP' 'OK' 'NLA is enabled (UserAuthentication=1)'
-            } else {
-                & $emit 'RDP' 'INFO' 'NLA/UserAuthentication not set on RDP-Tcp key (policy may control this)'
-            }
-
-            # fAllowSecProtocolNegotiation (also touched by -DisableNLA)
-            $aspn = $rdpP.fAllowSecProtocolNegotiation
-            if ($aspn -eq 0) {
-                & $emit 'RDP' (& $toSev $sevRdpSecProtoNeg) 'fAllowSecProtocolNegotiation=0 - security protocol negotiation disabled; run -EnableNLA or -FixRDP to reset' "-EnableNLA"
-            }
-
-            # MinEncryptionLevel (1=Low was set by -DisableNLA; default is typically 2)
-            $mel = $rdpP.MinEncryptionLevel
-            if ($null -ne $mel -and $mel -lt 2) {
-                & $emit 'RDP' (& $toSev $sevRdpMinEncLevel) "MinEncryptionLevel=$mel (below recommended 2) - may indicate NLA was disabled" "-EnableNLA"
-            }
-
-            # SSL certificate thumbprint - absence is normal (Windows generates one on first RDP connection)
-            $cert = $rdpP.SSLCertificateSHA1Hash
-            if ($null -ne $cert -and -not ($cert -is [byte[]] -and $cert.Count -eq 0)) {
-                & $emit 'RDP' 'OK' 'RDP SSL certificate thumbprint is present'
-            }
-            # No thumbprint = not flagged; Windows auto-generates one at first RDP connection
-        } else {
-            & $emit 'RDP' (& $toSev $sevRdpTcpKeyMissing) 'RDP-Tcp WinStation key not found - RDP listener may be misconfigured' "-FixRDP"
-        }
-
-        # RDP-related crypto services (required for certificate/key operations)
-        foreach ($cryptSvc in @(
-            @{ N='KeyIso';      DefStart=3; Desc='CNG Key Isolation (needed for RDP private key)' }
-            @{ N='CryptSvc';    DefStart=2; Desc='Cryptographic Services (needed for cert store)' }
-            @{ N='CertPropSvc'; DefStart=3; Desc='Certificate Propagation (needed for user certs)' }
-        )) {
-            $cs = (Get-ItemProperty "$svcRoot\$($cryptSvc.N)" -ErrorAction SilentlyContinue).Start
-            if ($cs -eq 4) {
-                & $emit 'RDP' (& $toSev $sevRdpCryptoSvcDisabled) "$($cryptSvc.N) ($($cryptSvc.Desc)) is DISABLED - RDP certificate operations will fail" "-FixRDPPermissions"
-            }
-        }
-
-        # TLS 1.2 explicitly disabled in SCHANNEL
-        foreach ($tlsRole in @('Client','Server')) {
-            $tlsPath = "$ctrlRoot\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\$tlsRole"
-            if (Test-Path $tlsPath) {
-                $tlsProps = Get-ItemProperty $tlsPath -ErrorAction SilentlyContinue
-                if ($tlsProps.Enabled -eq 0 -or $tlsProps.DisabledByDefault -eq 1) {
-                    & $emit 'RDP' (& $toSev $sevRdpTlsDisabled) "TLS 1.2 $tlsRole is explicitly DISABLED in SCHANNEL - RDP SSL handshake may fail" "-FixRDP"
+            # ── Critical boot services ──────────────────────────────────────────
+            # These disabled = guaranteed BSOD 0x7B or non-boot
+            $critical = @(
+                @{ N = 'disk'; ExpStart = 0; Desc = 'storage bus driver (0x7B if disabled)' }
+                @{ N = 'volmgr'; ExpStart = 0; Desc = 'volume manager (0x7B if disabled)' }
+                @{ N = 'partmgr'; ExpStart = 1; Desc = 'partition manager (0x7B if disabled)' }
+                @{ N = 'storport'; ExpStart = 0; Desc = 'storage port driver (0x7B if disabled)' }
+                @{ N = 'NTFS'; ExpStart = 1; Desc = 'NTFS filesystem driver (0x7B if disabled)' }
+                @{ N = 'volsnap'; ExpStart = 1; Desc = 'volume shadow copy filter' }
+                @{ N = 'msrpc'; ExpStart = 2; Desc = 'RPC subsystem' }
+                @{ N = 'rpcss'; ExpStart = 2; Desc = 'RPC Endpoint Mapper' }
+                @{ N = 'LSM'; ExpStart = 2; Desc = 'Local Session Manager' }
+            )
+            foreach ($s in $critical) {
+                $sp = "$svcRoot\$($s.N)"
+                if (Test-Path $sp) {
+                    $start = (Get-ItemProperty $sp -ErrorAction SilentlyContinue).Start
+                    if ($start -eq 4) {
+                        & $emit 'Services' (& $toSev $sevCriticalSvcDisabled) "$($s.N) is DISABLED (Start=4) - $($s.Desc) [ re-enable: Set Start=$($s.ExpStart) ]" "-EnableDriverOrService $($s.N)"
+                    }
                 }
             }
-        }
 
-        # NTLM restrictions
-        $msv1 = Get-ItemProperty "$ctrlRoot\Lsa\MSV1_0" -ErrorAction SilentlyContinue
-        if ($msv1) {
-            if ($msv1.RestrictSendingNTLMTraffic -ge 2 -or $msv1.RestrictReceivingNTLMTraffic -ge 1) {
-                & $emit 'RDP' (& $toSev $sevRdpNtlmRestrict) "NTLM restrictions: RestrictSending=$($msv1.RestrictSendingNTLMTraffic) RestrictReceiving=$($msv1.RestrictReceivingNTLMTraffic) - may block RDP auth" "-FixRDPAuth"
+            # ── RDP ────────────────────────────────────────────────────────────
+            $tsPath = "$ctrlRoot\Terminal Server"
+            $rdpTcpPath = "$ctrlRoot\Terminal Server\WinStations\RDP-Tcp"
+            $fDeny = (Get-ItemProperty $tsPath -ErrorAction SilentlyContinue).fDenyTSConnections
+            if ($fDeny -eq 1) {
+                & $emit 'RDP' (& $toSev $sevRdpDenied) 'fDenyTSConnections=1 - RDP is disabled at canonical key' "-FixRDP"
             }
-        }
+            elseif ($null -eq $fDeny) {
+                & $emit 'RDP' (& $toSev $sevRdpDenyUnknown) 'fDenyTSConnections not found - RDP state unclear' "-FixRDP"
+            }
+            else {
+                & $emit 'RDP' 'OK' 'fDenyTSConnections=0 - RDP is enabled'
+            }
 
-        # LmCompatibilityLevel (too restrictive blocks older clients)
-        $lsaProps = Get-ItemProperty "$ctrlRoot\Lsa" -ErrorAction SilentlyContinue
-        $lmCompat = $lsaProps.LmCompatibilityLevel
-        if ($null -ne $lmCompat -and $lmCompat -gt 5) {
-            & $emit 'RDP' (& $toSev $sevRdpLmCompat) "LmCompatibilityLevel=$lmCompat (>5) - may block NTLM-based RDP auth from some clients" "-FixRDPAuth"
-        }
-
-        # ── Credential Guard ────────────────────────────────────────────────
-        $cgLsa = $lsaProps.LsaCfgFlags
-        if ($cgLsa -and $cgLsa -ne 0) {
-            $lockType = if ($cgLsa -eq 1) { 'UEFI lock - registry change alone is insufficient' } else { 'software lock' }
-            & $emit 'Security' (& $toSev $sevCredentialGuard) "Credential Guard is enabled (LsaCfgFlags=$cgLsa, $lockType)" "-DisableCredentialGuard"
-        }
-        $runAsPPL = $lsaProps.RunAsPPL
-        if ($runAsPPL -eq 1) {
-            & $emit 'Security' (& $toSev $sevLsaPPL) 'LSA Protected Process (RunAsPPL=1) is active - may affect some security tools'
-        }
-
-        # ── Azure Guest Agent ────────────────────────────────────────────────
-        foreach ($ag in @('WindowsAzureGuestAgent','RdAgent')) {
-            $ap = "$svcRoot\$ag"
-            if (Test-Path $ap) {
-                $aStart = (Get-ItemProperty $ap -ErrorAction SilentlyContinue).Start
-                if ($aStart -eq 4) {
-                    & $emit 'AzureAgent' (& $toSev $sevAzureAgentDisabled) "$ag is DISABLED (Start=4) - VM will not respond to Azure platform operations" "-FixAzureGuestAgent"
-                } elseif ($aStart -ne 2) {
-                    & $emit 'AzureAgent' (& $toSev $sevAzureAgentWrongStart) "$ag Start=$aStart (expected 2/Auto)" "-FixAzureGuestAgent"
-                } else {
-                    & $emit 'AzureAgent' 'OK' "$ag Start=2 (Auto)"
+            # TermService, SessionEnv, UmRdpService
+            foreach ($rdpSvc in @(
+                    @{ N = 'TermService'; Desc = 'Remote Desktop Services'; Crit = $true }
+                    @{ N = 'SessionEnv'; Desc = 'Remote Desktop Config'; Crit = $true }
+                    @{ N = 'UmRdpService'; Desc = 'RDP UserMode Port Redirector'; Crit = $false }
+                )) {
+                $svcStart = (Get-ItemProperty "$svcRoot\$($rdpSvc.N)" -ErrorAction SilentlyContinue).Start
+                if ($svcStart -eq 4) {
+                    $sev = if ($rdpSvc.Crit) { (& $toSev $sevRdpSvcDisabledCrit) } else { (& $toSev $sevRdpSvcDisabledWarn) }
+                    & $emit 'RDP' $sev "$($rdpSvc.N) ($($rdpSvc.Desc)) is DISABLED (Start=4) - RDP will not work" "-FixRDP"
                 }
-            } else {
-                & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) "$ag not found in registry - agent may not be installed" "-InstallAzureVMAgent"
-            }
-        }
-
-        # ── Networking: BFE & TCP/IP ─────────────────────────────────────────
-        $bfeStart = (Get-ItemProperty "$svcRoot\BFE" -ErrorAction SilentlyContinue).Start
-        if ($bfeStart -eq 4) {
-            & $emit 'Networking' (& $toSev $sevBfeDisabled) 'BFE (Base Filtering Engine) is DISABLED - Windows Firewall and IPSec/network policy will not function' "-EnableBFE"
-        } elseif ($null -ne $bfeStart) {
-            & $emit 'Networking' 'OK' "BFE Start=$bfeStart (enabled)"
-        }
-        $tcpStart = (Get-ItemProperty "$svcRoot\Tcpip" -ErrorAction SilentlyContinue).Start
-        if ($tcpStart -eq 4) {
-            & $emit 'Networking' (& $toSev $sevTcpipDisabled) 'Tcpip service is DISABLED - no network will be available' "-ResetNetworkStack"
-        }
-
-        # Additional networking services
-        foreach ($netSvc in @(
-            @{ N='Dnscache';         Desc='DNS Client - name resolution will fail' }
-            @{ N='NlaSvc';           Desc='Network Location Awareness - network profile detection will fail' }
-            @{ N='Dhcp';             Desc='DHCP Client - automatic IP configuration will not work' }
-            @{ N='LanmanWorkstation'; Desc='Workstation service (SMB client) - file sharing access will fail' }
-            @{ N='LanmanServer';      Desc='Server service (SMB server) - file sharing hosting will fail' }
-        )) {
-            $ns = (Get-ItemProperty "$svcRoot\$($netSvc.N)" -ErrorAction SilentlyContinue).Start
-            if ($ns -eq 4) {
-                & $emit 'Networking' (& $toSev $sevNetSvcDisabled) "$($netSvc.N) is DISABLED - $($netSvc.Desc)" "-ResetNetworkStack"
-            }
-        }
-
-        # SAN policy (partmgr)
-        $sanPolicy = (Get-ItemProperty "$svcRoot\partmgr\Parameters" -ErrorAction SilentlyContinue).SanPolicy
-        if ($null -ne $sanPolicy -and $sanPolicy -ne 1 -and $sanPolicy -ne 0) {
-            $sanDesc = switch ($sanPolicy) { 2 {'OfflineShared - shared disks stay offline'} 3 {'OfflineAll - all SAN disks stay offline'} 4 {'OfflineInternal - internal SAN disks offline'} default {"Value=$sanPolicy"} }
-            & $emit 'Networking' (& $toSev $sevSanPolicy) "SAN policy is set to $sanDesc - data disks may not come online after migration; run -FixSanPolicy to set OnlineAll" "-FixSanPolicy"
-        } elseif ($null -ne $sanPolicy) {
-            & $emit 'Networking' 'OK' "SAN policy: OnlineAll ($sanPolicy)"
-        }
-
-        # ── Boot/System drivers with missing binaries ─────────────────────────
-        # We only flag drivers that are registered to load at boot/system start
-        # but whose binary is ABSENT on the offline disk - these WILL cause a
-        # BSOD or hang on next boot. Inbox hardware drivers (LSI, Intel RST,
-        # Broadcom HBA, etc.) ship with Windows but carry vendor company names;
-        # they are NOT flagged here because they are safe and present on disk.
-        # Use -DisableThirdPartyDrivers to intentionally suppress all non-MS
-        # drivers when troubleshooting a clean-boot scenario.
-        $missingDrivers = [System.Collections.Generic.List[string]]::new()
-        Get-ChildItem $svcRoot -ErrorAction SilentlyContinue | ForEach-Object {
-            $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-            # Only kernel/filesystem drivers (Type 1/2) at Boot(0) or System(1) start
-            if ($p.Type -notin @(1,2) -or $p.Start -notin @(0,1) -or -not $p.ImagePath) { return }
-            $imgR = $p.ImagePath `
-                -replace '(?i)\\SystemRoot\\', "$script:WinDriveLetter\Windows\" `
-                -replace '(?i)%SystemRoot%',   "$script:WinDriveLetter\Windows" `
-                -replace '(?i)\\\?\?\\',      '' `
-                -replace '(?i)^system32\\',   "$script:WinDriveLetter\Windows\System32\\"
-            if ($imgR -match '^(.+?\.(?:sys|exe))') { $imgR = $Matches[1] }
-            # Only flag if binary is genuinely missing
-            if (-not (Test-Path $imgR)) { $missingDrivers.Add("$($_.PSChildName) ($($p.ImagePath))") }
-        }
-        if ($missingDrivers.Count -gt 0) {
-            & $emit 'Drivers' (& $toSev $sevMissingDriverBinaries) "$($missingDrivers.Count) Boot/System driver(s) registered but binary MISSING - will BSOD on boot: $($missingDrivers -join ', ')" "-DisableThirdPartyDrivers"
-        } else {
-            & $emit 'Drivers' 'OK' 'All Boot/System drivers have binaries present on disk'
-        }
-
-        # ── Device class filters ─────────────────────────────────────────────
-        $classRoot   = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
-        $safeFilters = @{
-            '{4d36e967-e325-11ce-bfc1-08002be10318}' = [string[]]@('partmgr','fvevol','iorate','storqosflt','wcifs','ehstorclass')
-            '{4d36e96a-e325-11ce-bfc1-08002be10318}' = [string[]]@('iasf','iastorf')
-            '{4d36e97b-e325-11ce-bfc1-08002be10318}' = [string[]]@()
-            '{71a27cdd-812a-11d0-bec7-08002be2092f}' = [string[]]@('volsnap','fvevol','rdyboost','spldr','volmgrx','iorate','storqosflt')
-            '{4d36e972-e325-11ce-bfc1-08002be10318}' = [string[]]@('wfplwf','ndiscap','ndisimplatformmpfilter','vmsproxyhnicfilter','vms3cap','mslldp','psched','bridge')
-        }
-        $filterClasses = @(
-            @{ GUID='{4d36e967-e325-11ce-bfc1-08002be10318}'; Name='DiskDrive';      Sev=(& $toSev $sevDeviceFiltersCrit) }
-            @{ GUID='{4d36e96a-e325-11ce-bfc1-08002be10318}'; Name='SCSIAdapter';    Sev=(& $toSev $sevDeviceFiltersCrit) }
-            @{ GUID='{4d36e97b-e325-11ce-bfc1-08002be10318}'; Name='SCSIController'; Sev=(& $toSev $sevDeviceFiltersCrit) }
-            @{ GUID='{71a27cdd-812a-11d0-bec7-08002be2092f}'; Name='Volume';         Sev=(& $toSev $sevDeviceFiltersWarn) }
-            @{ GUID='{4d36e972-e325-11ce-bfc1-08002be10318}'; Name='Net';            Sev=(& $toSev $sevDeviceFiltersWarn) }
-        )
-        foreach ($fc in $filterClasses) {
-            $cp = "$classRoot\$($fc.GUID)"
-            if (-not (Test-Path $cp)) { continue }
-            $safe = $safeFilters[$fc.GUID]
-            foreach ($ft in @('UpperFilters','LowerFilters')) {
-                $raw     = (Get-ItemProperty $cp -ErrorAction SilentlyContinue).$ft
-                $active  = @($raw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
-                $suspect = @($active | Where-Object { $safe -inotcontains $_ })
-                if ($suspect.Count -gt 0) {
-                    & $emit 'DeviceFilters' $fc.Sev "$($fc.Name) $ft contains non-standard entries: $($suspect -join ', ')" "-FixDeviceFilters"
+                elseif ($null -ne $svcStart) {
+                    & $emit 'RDP' 'OK' "$($rdpSvc.N) Start=$svcStart"
                 }
             }
-        }
 
-        # ── Orphaned NDIS bindings ────────────────────────────────────────────
-        $orphanIds  = [System.Collections.Generic.List[string]]::new()
-        $seenComp   = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($cg in @('{4D36E973-E325-11CE-BFC1-08002BE10318}','{4D36E974-E325-11CE-BFC1-08002BE10318}','{4D36E975-E325-11CE-BFC1-08002BE10318}')) {
-            $ck = "HKLM:\BROKENSYSTEM\$csName\Control\Class\$cg"
-            if (-not (Test-Path $ck)) { continue }
-            Get-ChildItem $ck -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' } | ForEach-Object {
-                $pp  = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-                $cid = if ($pp.ComponentId) { $pp.ComponentId } else { $pp.ComponentID }
-                if (-not $cid -or $cid -match '^ms_' -or -not $seenComp.Add($cid)) { return }
-                $sn  = $cid -replace '^ms_',''
-                $ipp = (Get-ItemProperty "$svcRoot\$sn" -ErrorAction SilentlyContinue).ImagePath
-                if ($null -eq $ipp) { return }
-                $ir  = $ipp -replace '(?i)\\SystemRoot\\',"$script:WinDriveLetter\Windows\" `
-                           -replace '(?i)%SystemRoot%',  "$script:WinDriveLetter\Windows" `
-                           -replace '(?i)\\\?\?\\',     '' `
-                           -replace '(?i)^system32\\',  "$script:WinDriveLetter\Windows\System32\\"
-                if ($ir -match '^(.+?\.(?:sys|exe|dll))') { $ir = $Matches[1] }
-                if (-not (Test-Path $ir)) { $orphanIds.Add($cid) }
+            if (Test-Path $rdpTcpPath) {
+                $rdpP = Get-ItemProperty $rdpTcpPath -ErrorAction SilentlyContinue
+
+                # Port number
+                $rdpPort = $rdpP.PortNumber
+                if ($null -ne $rdpPort -and $rdpPort -ne 3389) {
+                    & $emit 'RDP' (& $toSev $sevRdpNonDefaultPort) "RDP-Tcp port is $rdpPort (not the default 3389) - ensure firewall allows this port or run -FixRDP to reset" "-FixRDP"
+                }
+                else {
+                    & $emit 'RDP' 'OK' "RDP-Tcp port: $(if ($null -eq $rdpPort) { '(not set, default 3389)' } else { $rdpPort })"
+                }
+
+                # Security layer
+                $sl = $rdpP.SecurityLayer
+                if ($null -ne $sl) {
+                    $slDesc = switch ($sl) { 0 { 'RDP native (no SSL) - weakest encryption' } 1 { 'Negotiate' } 2 { 'SSL/TLS required' } default { "Unknown ($sl)" } }
+                    $slSev = if ($sl -eq 0) { (& $toSev $sevRdpSecurityLayerWeak) } else { 'INFO' }
+                    & $emit 'RDP' $slSev "SecurityLayer=$sl ($slDesc)"
+                }
+
+                # NLA / UserAuthentication
+                $ua = $rdpP.UserAuthentication
+                if ($ua -eq 0) {
+                    & $emit 'RDP' (& $toSev $sevRdpNLADisabled) 'NLA is DISABLED (UserAuthentication=0) - any user can attempt login without pre-auth; run -EnableNLA to restore' "-EnableNLA"
+                }
+                elseif ($ua -eq 1) {
+                    & $emit 'RDP' 'OK' 'NLA is enabled (UserAuthentication=1)'
+                }
+                else {
+                    & $emit 'RDP' 'INFO' 'NLA/UserAuthentication not set on RDP-Tcp key (policy may control this)'
+                }
+
+                # fAllowSecProtocolNegotiation (also touched by -DisableNLA)
+                $aspn = $rdpP.fAllowSecProtocolNegotiation
+                if ($aspn -eq 0) {
+                    & $emit 'RDP' (& $toSev $sevRdpSecProtoNeg) 'fAllowSecProtocolNegotiation=0 - security protocol negotiation disabled; run -EnableNLA or -FixRDP to reset' "-EnableNLA"
+                }
+
+                # MinEncryptionLevel (1=Low was set by -DisableNLA; default is typically 2)
+                $mel = $rdpP.MinEncryptionLevel
+                if ($null -ne $mel -and $mel -lt 2) {
+                    & $emit 'RDP' (& $toSev $sevRdpMinEncLevel) "MinEncryptionLevel=$mel (below recommended 2) - may indicate NLA was disabled" "-EnableNLA"
+                }
+
+                # SSL certificate thumbprint - absence is normal (Windows generates one on first RDP connection)
+                $cert = $rdpP.SSLCertificateSHA1Hash
+                if ($null -ne $cert -and -not ($cert -is [byte[]] -and $cert.Count -eq 0)) {
+                    & $emit 'RDP' 'OK' 'RDP SSL certificate thumbprint is present'
+                }
+                # No thumbprint = not flagged; Windows auto-generates one at first RDP connection
             }
-        }
-        if ($orphanIds.Count -gt 0) {
-            & $emit 'Networking' (& $toSev $sevOrphanedNdis) "Orphaned NDIS binding(s) with missing binary: $($orphanIds -join ', ') - will prevent network initialisation at boot" "-FixNetBindings"
-        } else {
-            & $emit 'Networking' 'OK' 'No orphaned NDIS binding components'
-        }
-
-        # ── Windows Update services ──────────────────────────────────────────
-        foreach ($wu in @('wuauserv','UsoSvc','WaaSMedicSvc')) {
-            $wuS = (Get-ItemProperty "$svcRoot\$wu" -ErrorAction SilentlyContinue).Start
-            if ($wuS -eq 4) {
-                & $emit 'WindowsUpdate' (& $toSev $sevUpdateWuDisabled) "$wu is disabled (Start=4) - intentionally stopped via -DisableWindowsUpdate; re-enable on the live VM with: Set-Service -Name $wu -StartupType Automatic"
+            else {
+                & $emit 'RDP' (& $toSev $sevRdpTcpKeyMissing) 'RDP-Tcp WinStation key not found - RDP listener may be misconfigured' "-FixRDP"
             }
-        }
 
-        # AppIDSvc (AppLocker enforcement service)
-        $appIdSvc = (Get-ItemProperty "$svcRoot\AppIDSvc" -ErrorAction SilentlyContinue).Start
-        if ($null -ne $appIdSvc -and $appIdSvc -ne 4) {
-            & $emit 'Security' (& $toSev $sevAppIdSvc) "AppIDSvc (Application Identity) Start=$appIdSvc - this service is required for AppLocker to enforce rules"
-        }
-
-        # ── Hyper-V ACPI device IDs ─────────────────────────────────────────
-        $enumAcpiRoot    = "HKLM:\BROKENSYSTEM\$csName\Enum\ACPI"
-        $msft1000Present = Test-Path "$enumAcpiRoot\MSFT1000"
-        $msft1002Present = Test-Path "$enumAcpiRoot\MSFT1002"
-        if (-not $msft1000Present -or -not $msft1002Present) {
-            $missing = @()
-            if (-not $msft1000Present) { $missing += 'MSFT1000 (VMBus)' }
-            if (-not $msft1002Present) { $missing += 'MSFT1002 (Hyper-V Gen Counter)' }
-            & $emit 'ACPI' (& $toSev $sevACPISettings) "Hyper-V ACPI device $(if ($missing.Count -gt 1){'entries'}else{'entry'}) missing: $($missing -join ', ') - newer ACPI IDs needed for full Hyper-V synthetic device support" "-CopyACPISettings"
-        } else {
-            & $emit 'ACPI' 'OK' 'Hyper-V ACPI device entries present (MSFT1000, MSFT1002)'
-        }
-
-        # ── Driver Verifier ──────────────────────────────────────────────────
-        $mmPath = "$ctrlRoot\Session Manager\Memory Management"
-        if (Test-Path $mmPath) {
-            $vDrivers = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDrivers
-            $vLevel   = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDriverLevel
-            if ($vDrivers -or $vLevel) {
-                $targets = if ($vDrivers -eq '*') { 'ALL drivers' } elseif ($vDrivers) { "drivers: $vDrivers" } else { "level=$vLevel" }
-                & $emit 'Drivers' (& $toSev $sevDriverVerifier) "Driver Verifier is ENABLED ($targets) - will BSOD on any verification failure; disable with -DisableDriverVerifier" "-DisableDriverVerifier"
-            } else {
-                & $emit 'Drivers' 'OK' 'Driver Verifier is not configured'
+            # RDP-related crypto services (required for certificate/key operations)
+            foreach ($cryptSvc in @(
+                    @{ N = 'KeyIso'; DefStart = 3; Desc = 'CNG Key Isolation (needed for RDP private key)' }
+                    @{ N = 'CryptSvc'; DefStart = 2; Desc = 'Cryptographic Services (needed for cert store)' }
+                    @{ N = 'CertPropSvc'; DefStart = 3; Desc = 'Certificate Propagation (needed for user certs)' }
+                )) {
+                $cs = (Get-ItemProperty "$svcRoot\$($cryptSvc.N)" -ErrorAction SilentlyContinue).Start
+                if ($cs -eq 4) {
+                    & $emit 'RDP' (& $toSev $sevRdpCryptoSvcDisabled) "$($cryptSvc.N) ($($cryptSvc.Desc)) is DISABLED - RDP certificate operations will fail" "-FixRDPPermissions"
+                }
             }
-        }
 
-        # ── Firewall state ───────────────────────────────────────────────────
-        $fwBase = "$SystemRoot\Services\SharedAccess\Parameters\FirewallPolicy"
-        $fwAllDisabled = $true
-        foreach ($fwProf in @('DomainProfile','StandardProfile','PublicProfile')) {
-            $fwPath = "$fwBase\$fwProf"
-            if (Test-Path $fwPath) {
-                $fwEnabled = (Get-ItemProperty $fwPath -ErrorAction SilentlyContinue).EnableFirewall
-                if ($fwEnabled -ne 0) { $fwAllDisabled = $false }
+            # TLS 1.2 explicitly disabled in SCHANNEL
+            foreach ($tlsRole in @('Client', 'Server')) {
+                $tlsPath = "$ctrlRoot\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\$tlsRole"
+                if (Test-Path $tlsPath) {
+                    $tlsProps = Get-ItemProperty $tlsPath -ErrorAction SilentlyContinue
+                    if ($tlsProps.Enabled -eq 0 -or $tlsProps.DisabledByDefault -eq 1) {
+                        & $emit 'RDP' (& $toSev $sevRdpTlsDisabled) "TLS 1.2 $tlsRole is explicitly DISABLED in SCHANNEL - RDP SSL handshake may fail" "-FixRDP"
+                    }
+                }
             }
-        }
-        if (-not $fwAllDisabled) {
-            & $emit 'Firewall' (& $toSev $sevFirewallEnabled) 'Windows Firewall is enabled - verify RDP (TCP 3389) is allowed inbound; use -DisableFirewall to disable for troubleshooting' "-DisableFirewall"
-        } else {
-            & $emit 'Firewall' 'OK' 'Windows Firewall is disabled on all profiles'
-        }
 
-        # ── Static DNS ───────────────────────────────────────────────────────
-        $ifBase = "$SystemRoot\Services\Tcpip\Parameters\Interfaces"
-        if (Test-Path $ifBase) {
-            $staticDns = [System.Collections.Generic.List[string]]::new()
-            Get-ChildItem $ifBase -ErrorAction SilentlyContinue | ForEach-Object {
-                $ns = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).NameServer
-                if ($ns) { $staticDns.Add("$($_.PSChildName): $ns") }
+            # NTLM restrictions
+            $msv1 = Get-ItemProperty "$ctrlRoot\Lsa\MSV1_0" -ErrorAction SilentlyContinue
+            if ($msv1) {
+                if ($msv1.RestrictSendingNTLMTraffic -ge 2 -or $msv1.RestrictReceivingNTLMTraffic -ge 1) {
+                    & $emit 'RDP' (& $toSev $sevRdpNtlmRestrict) "NTLM restrictions: RestrictSending=$($msv1.RestrictSendingNTLMTraffic) RestrictReceiving=$($msv1.RestrictReceivingNTLMTraffic) - may block RDP auth" "-FixRDPAuth"
+                }
             }
-            $globalNs = (Get-ItemProperty "$SystemRoot\Services\Tcpip\Parameters" -ErrorAction SilentlyContinue).NameServer
-            if ($globalNs) { $staticDns.Add("Global: $globalNs") }
-            if ($staticDns.Count -gt 0) {
-                & $emit 'Networking' (& $toSev $sevStaticDns) "Static DNS server(s) configured on $($staticDns.Count) interface(s) - may not resolve after migration; -ResetNetworkStack clears them" "-ResetNetworkStack"
-            }
-        }
 
-        # ── EMS / Serial Console ─────────────────────────────────────────────
-        # Check BCD for EMS (done outside hive, but while we're still here)
+            # LmCompatibilityLevel (too restrictive blocks older clients)
+            $lsaProps = Get-ItemProperty "$ctrlRoot\Lsa" -ErrorAction SilentlyContinue
+            $lmCompat = $lsaProps.LmCompatibilityLevel
+            if ($null -ne $lmCompat -and $lmCompat -gt 5) {
+                & $emit 'RDP' (& $toSev $sevRdpLmCompat) "LmCompatibilityLevel=$lmCompat (>5) - may block NTLM-based RDP auth from some clients" "-FixRDPAuth"
+            }
+
+            # ── Credential Guard ────────────────────────────────────────────────
+            $cgLsa = $lsaProps.LsaCfgFlags
+            if ($cgLsa -and $cgLsa -ne 0) {
+                $lockType = if ($cgLsa -eq 1) { 'UEFI lock - registry change alone is insufficient' } else { 'software lock' }
+                & $emit 'Security' (& $toSev $sevCredentialGuard) "Credential Guard is enabled (LsaCfgFlags=$cgLsa, $lockType)" "-DisableCredentialGuard"
+            }
+            $runAsPPL = $lsaProps.RunAsPPL
+            if ($runAsPPL -eq 1) {
+                & $emit 'Security' (& $toSev $sevLsaPPL) 'LSA Protected Process (RunAsPPL=1) is active - may affect some security tools'
+            }
+
+            # ── Azure Guest Agent ────────────────────────────────────────────────
+            foreach ($ag in @('WindowsAzureGuestAgent', 'RdAgent')) {
+                $ap = "$svcRoot\$ag"
+                if (Test-Path $ap) {
+                    $aStart = (Get-ItemProperty $ap -ErrorAction SilentlyContinue).Start
+                    if ($aStart -eq 4) {
+                        & $emit 'AzureAgent' (& $toSev $sevAzureAgentDisabled) "$ag is DISABLED (Start=4) - VM will not respond to Azure platform operations" "-FixAzureGuestAgent"
+                    }
+                    elseif ($aStart -ne 2) {
+                        & $emit 'AzureAgent' (& $toSev $sevAzureAgentWrongStart) "$ag Start=$aStart (expected 2/Auto)" "-FixAzureGuestAgent"
+                    }
+                    else {
+                        & $emit 'AzureAgent' 'OK' "$ag Start=2 (Auto)"
+                    }
+                }
+                else {
+                    & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) "$ag not found in registry - agent may not be installed" "-InstallAzureVMAgent"
+                }
+            }
+
+            # ── Networking: BFE & TCP/IP ─────────────────────────────────────────
+            $bfeStart = (Get-ItemProperty "$svcRoot\BFE" -ErrorAction SilentlyContinue).Start
+            if ($bfeStart -eq 4) {
+                & $emit 'Networking' (& $toSev $sevBfeDisabled) 'BFE (Base Filtering Engine) is DISABLED - Windows Firewall and IPSec/network policy will not function' "-EnableBFE"
+            }
+            elseif ($null -ne $bfeStart) {
+                & $emit 'Networking' 'OK' "BFE Start=$bfeStart (enabled)"
+            }
+            $tcpStart = (Get-ItemProperty "$svcRoot\Tcpip" -ErrorAction SilentlyContinue).Start
+            if ($tcpStart -eq 4) {
+                & $emit 'Networking' (& $toSev $sevTcpipDisabled) 'Tcpip service is DISABLED - no network will be available' "-ResetNetworkStack"
+            }
+
+            # Additional networking services
+            foreach ($netSvc in @(
+                    @{ N = 'Dnscache'; Desc = 'DNS Client - name resolution will fail' }
+                    @{ N = 'NlaSvc'; Desc = 'Network Location Awareness - network profile detection will fail' }
+                    @{ N = 'Dhcp'; Desc = 'DHCP Client - automatic IP configuration will not work' }
+                    @{ N = 'LanmanWorkstation'; Desc = 'Workstation service (SMB client) - file sharing access will fail' }
+                    @{ N = 'LanmanServer'; Desc = 'Server service (SMB server) - file sharing hosting will fail' }
+                )) {
+                $ns = (Get-ItemProperty "$svcRoot\$($netSvc.N)" -ErrorAction SilentlyContinue).Start
+                if ($ns -eq 4) {
+                    & $emit 'Networking' (& $toSev $sevNetSvcDisabled) "$($netSvc.N) is DISABLED - $($netSvc.Desc)" "-ResetNetworkStack"
+                }
+            }
+
+            # SAN policy (partmgr)
+            $sanPolicy = (Get-ItemProperty "$svcRoot\partmgr\Parameters" -ErrorAction SilentlyContinue).SanPolicy
+            if ($null -ne $sanPolicy -and $sanPolicy -ne 1 -and $sanPolicy -ne 0) {
+                $sanDesc = switch ($sanPolicy) { 2 { 'OfflineShared - shared disks stay offline' } 3 { 'OfflineAll - all SAN disks stay offline' } 4 { 'OfflineInternal - internal SAN disks offline' } default { "Value=$sanPolicy" } }
+                & $emit 'Networking' (& $toSev $sevSanPolicy) "SAN policy is set to $sanDesc - data disks may not come online after migration; run -FixSanPolicy to set OnlineAll" "-FixSanPolicy"
+            }
+            elseif ($null -ne $sanPolicy) {
+                & $emit 'Networking' 'OK' "SAN policy: OnlineAll ($sanPolicy)"
+            }
+
+            # ── Boot/System drivers with missing binaries ─────────────────────────
+            # We only flag drivers that are registered to load at boot/system start
+            # but whose binary is ABSENT on the offline disk - these WILL cause a
+            # BSOD or hang on next boot. Inbox hardware drivers (LSI, Intel RST,
+            # Broadcom HBA, etc.) ship with Windows but carry vendor company names;
+            # they are NOT flagged here because they are safe and present on disk.
+            # Use -DisableThirdPartyDrivers to intentionally suppress all non-MS
+            # drivers when troubleshooting a clean-boot scenario.
+            $missingDrivers = [System.Collections.Generic.List[string]]::new()
+            Get-ChildItem $svcRoot -ErrorAction SilentlyContinue | ForEach-Object {
+                $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                # Only kernel/filesystem drivers (Type 1/2) at Boot(0) or System(1) start
+                if ($p.Type -notin @(1, 2) -or $p.Start -notin @(0, 1) -or -not $p.ImagePath) { return }
+                $imgR = Resolve-GuestImagePath $p.ImagePath
+                # Only flag if binary is genuinely missing
+                if (-not (Test-Path $imgR)) { $missingDrivers.Add("$($_.PSChildName) ($($p.ImagePath))") }
+            }
+            if ($missingDrivers.Count -gt 0) {
+                & $emit 'Drivers' (& $toSev $sevMissingDriverBinaries) "$($missingDrivers.Count) Boot/System driver(s) registered but binary MISSING - will BSOD on boot: $($missingDrivers -join ', ')" "-DisableThirdPartyDrivers"
+            }
+            else {
+                & $emit 'Drivers' 'OK' 'All Boot/System drivers have binaries present on disk'
+            }
+
+            # ── Device class filters ─────────────────────────────────────────────
+            $classRoot = "HKLM:\BROKENSYSTEM\$csName\Control\Class"
+            $safeFilters = @{
+                '{4d36e967-e325-11ce-bfc1-08002be10318}' = [string[]]@('partmgr', 'fvevol', 'iorate', 'storqosflt', 'wcifs', 'ehstorclass')
+                '{4d36e96a-e325-11ce-bfc1-08002be10318}' = [string[]]@('iasf', 'iastorf')
+                '{4d36e97b-e325-11ce-bfc1-08002be10318}' = [string[]]@()
+                '{71a27cdd-812a-11d0-bec7-08002be2092f}' = [string[]]@('volsnap', 'fvevol', 'rdyboost', 'spldr', 'volmgrx', 'iorate', 'storqosflt')
+                '{4d36e972-e325-11ce-bfc1-08002be10318}' = [string[]]@('wfplwf', 'ndiscap', 'ndisimplatformmpfilter', 'vmsproxyhnicfilter', 'vms3cap', 'mslldp', 'psched', 'bridge')
+            }
+            $filterClasses = @(
+                @{ GUID = '{4d36e967-e325-11ce-bfc1-08002be10318}'; Name = 'DiskDrive'; Sev = (& $toSev $sevDeviceFiltersCrit) }
+                @{ GUID = '{4d36e96a-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIAdapter'; Sev = (& $toSev $sevDeviceFiltersCrit) }
+                @{ GUID = '{4d36e97b-e325-11ce-bfc1-08002be10318}'; Name = 'SCSIController'; Sev = (& $toSev $sevDeviceFiltersCrit) }
+                @{ GUID = '{71a27cdd-812a-11d0-bec7-08002be2092f}'; Name = 'Volume'; Sev = (& $toSev $sevDeviceFiltersWarn) }
+                @{ GUID = '{4d36e972-e325-11ce-bfc1-08002be10318}'; Name = 'Net'; Sev = (& $toSev $sevDeviceFiltersWarn) }
+            )
+            foreach ($fc in $filterClasses) {
+                $cp = "$classRoot\$($fc.GUID)"
+                if (-not (Test-Path $cp)) { continue }
+                $safe = $safeFilters[$fc.GUID]
+                foreach ($ft in @('UpperFilters', 'LowerFilters')) {
+                    $raw = (Get-ItemProperty $cp -ErrorAction SilentlyContinue).$ft
+                    $active = @($raw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                    $suspect = @($active | Where-Object { $safe -inotcontains $_ })
+                    if ($suspect.Count -gt 0) {
+                        & $emit 'DeviceFilters' $fc.Sev "$($fc.Name) $ft contains non-standard entries: $($suspect -join ', ')" "-FixDeviceFilters"
+                    }
+                }
+            }
+
+            # ── Orphaned NDIS bindings ────────────────────────────────────────────
+            $orphanIds = [System.Collections.Generic.List[string]]::new()
+            $seenComp = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($cg in @('{4D36E973-E325-11CE-BFC1-08002BE10318}', '{4D36E974-E325-11CE-BFC1-08002BE10318}', '{4D36E975-E325-11CE-BFC1-08002BE10318}')) {
+                $ck = "HKLM:\BROKENSYSTEM\$csName\Control\Class\$cg"
+                if (-not (Test-Path $ck)) { continue }
+                Get-ChildItem $ck -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' } | ForEach-Object {
+                    $pp = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                    $cid = if ($pp.ComponentId) { $pp.ComponentId } else { $pp.ComponentID }
+                    if (-not $cid -or $cid -match '^ms_' -or -not $seenComp.Add($cid)) { return }
+                    $sn = $cid -replace '^ms_', ''
+                    $ipp = (Get-ItemProperty "$svcRoot\$sn" -ErrorAction SilentlyContinue).ImagePath
+                    if ($null -eq $ipp) { return }
+                    $ir = Resolve-GuestImagePath $ipp
+                    if (-not (Test-Path $ir)) { $orphanIds.Add($cid) }
+                }
+            }
+            if ($orphanIds.Count -gt 0) {
+                & $emit 'Networking' (& $toSev $sevOrphanedNdis) "Orphaned NDIS binding(s) with missing binary: $($orphanIds -join ', ') - will prevent network initialisation at boot" "-FixNetBindings"
+            }
+            else {
+                & $emit 'Networking' 'OK' 'No orphaned NDIS binding components'
+            }
+
+            # ── Windows Update services ──────────────────────────────────────────
+            foreach ($wu in @('wuauserv', 'UsoSvc', 'WaaSMedicSvc')) {
+                $wuS = (Get-ItemProperty "$svcRoot\$wu" -ErrorAction SilentlyContinue).Start
+                if ($wuS -eq 4) {
+                    & $emit 'WindowsUpdate' (& $toSev $sevUpdateWuDisabled) "$wu is disabled (Start=4) - intentionally stopped via -DisableWindowsUpdate; re-enable on the live VM with: Set-Service -Name $wu -StartupType Automatic"
+                }
+            }
+
+            # AppIDSvc (AppLocker enforcement service)
+            $appIdSvc = (Get-ItemProperty "$svcRoot\AppIDSvc" -ErrorAction SilentlyContinue).Start
+            if ($null -ne $appIdSvc -and $appIdSvc -ne 4) {
+                & $emit 'Security' (& $toSev $sevAppIdSvc) "AppIDSvc (Application Identity) Start=$appIdSvc - this service is required for AppLocker to enforce rules"
+            }
+
+            # ── Hyper-V ACPI device IDs ─────────────────────────────────────────
+            $enumAcpiRoot = "HKLM:\BROKENSYSTEM\$csName\Enum\ACPI"
+            $msft1000Present = Test-Path "$enumAcpiRoot\MSFT1000"
+            $msft1002Present = Test-Path "$enumAcpiRoot\MSFT1002"
+            if (-not $msft1000Present -or -not $msft1002Present) {
+                $missing = @()
+                if (-not $msft1000Present) { $missing += 'MSFT1000 (VMBus)' }
+                if (-not $msft1002Present) { $missing += 'MSFT1002 (Hyper-V Gen Counter)' }
+                & $emit 'ACPI' (& $toSev $sevACPISettings) "Hyper-V ACPI device $(if ($missing.Count -gt 1){'entries'}else{'entry'}) missing: $($missing -join ', ') - newer ACPI IDs needed for full Hyper-V synthetic device support" "-CopyACPISettings"
+            }
+            else {
+                & $emit 'ACPI' 'OK' 'Hyper-V ACPI device entries present (MSFT1000, MSFT1002)'
+            }
+
+            # ── Driver Verifier ──────────────────────────────────────────────────
+            $mmPath = "$ctrlRoot\Session Manager\Memory Management"
+            if (Test-Path $mmPath) {
+                $vDrivers = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDrivers
+                $vLevel = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDriverLevel
+                if ($vDrivers -or $vLevel) {
+                    $targets = if ($vDrivers -eq '*') { 'ALL drivers' } elseif ($vDrivers) { "drivers: $vDrivers" } else { "level=$vLevel" }
+                    & $emit 'Drivers' (& $toSev $sevDriverVerifier) "Driver Verifier is ENABLED ($targets) - will BSOD on any verification failure; disable with -DisableDriverVerifier" "-DisableDriverVerifier"
+                }
+                else {
+                    & $emit 'Drivers' 'OK' 'Driver Verifier is not configured'
+                }
+            }
+
+            # ── Firewall state ───────────────────────────────────────────────────
+            $fwBase = "$SystemRoot\Services\SharedAccess\Parameters\FirewallPolicy"
+            $fwAllDisabled = $true
+            foreach ($fwProf in @('DomainProfile', 'StandardProfile', 'PublicProfile')) {
+                $fwPath = "$fwBase\$fwProf"
+                if (Test-Path $fwPath) {
+                    $fwEnabled = (Get-ItemProperty $fwPath -ErrorAction SilentlyContinue).EnableFirewall
+                    if ($fwEnabled -ne 0) { $fwAllDisabled = $false }
+                }
+            }
+            if (-not $fwAllDisabled) {
+                & $emit 'Firewall' (& $toSev $sevFirewallEnabled) 'Windows Firewall is enabled - verify RDP (TCP 3389) is allowed inbound; use -DisableFirewall to disable for troubleshooting' "-DisableFirewall"
+            }
+            else {
+                & $emit 'Firewall' 'OK' 'Windows Firewall is disabled on all profiles'
+            }
+
+            # ── Gen2 UEFI / Trusted Launch security (registry-based) ────────────
+            if ($script:VMGen -eq 2) {
+                Write-Host "--- Gen2 UEFI / Trusted Launch Security" -ForegroundColor DarkGray
+
+                # Secure Boot state: did the guest OS previously boot with Secure Boot?
+                $sbStatePath = "$ctrlRoot\SecureBoot\State"
+                $sbEnabled = $null
+                if (Test-Path $sbStatePath) {
+                    $sbEnabled = (Get-ItemProperty $sbStatePath -ErrorAction SilentlyContinue).UEFISecureBootEnabled
+                }
+                if ($sbEnabled -eq 1) {
+                    & $emit 'UEFI' (& $toSev $sevSecureBootState) 'Guest was previously running with Secure Boot enabled (UEFISecureBootEnabled=1)'
+                    # Cross-reference: testsigning or nointegritychecks in BCD would be fatal
+                    try {
+                        $bcdPathSb = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter.TrimEnd('\')
+                        if (Test-Path $bcdPathSb) {
+                            $bcdSbText = (& bcdedit.exe /store "$bcdPathSb" /enum all 2>&1) | Out-String
+                            if ($bcdSbText -match 'testsigning\s+yes') {
+                                & $emit 'UEFI' (& $toSev $sevSecureBootConflict) 'CONFLICT: Test signing is ON but guest had Secure Boot enabled - VM will fail to boot with Secure Boot; disable test signing first' "-DisableTestSigning"
+                            }
+                            if ($bcdSbText -match 'nointegritychecks\s+yes') {
+                                & $emit 'UEFI' (& $toSev $sevSecureBootConflict) 'CONFLICT: nointegritychecks is ON but guest had Secure Boot enabled - VM will fail to boot with Secure Boot' "-FixBoot"
+                            }
+                        }
+                    }
+                    catch { <# BCD already checked above; non-fatal here #> }
+                }
+                elseif ($null -ne $sbEnabled) {
+                    & $emit 'UEFI' 'OK' 'Secure Boot was not active on guest (UEFISecureBootEnabled=0)'
+                }
+                else {
+                    & $emit 'UEFI' 'INFO' 'SecureBoot\\State key not found - guest may not have booted with UEFI Secure Boot awareness'
+                }
+
+                # VBS / DeviceGuard configuration
+                $dgPath = "$ctrlRoot\DeviceGuard"
+                if (Test-Path $dgPath) {
+                    $dgProps = Get-ItemProperty $dgPath -ErrorAction SilentlyContinue
+                    $vbsEnabled = $dgProps.EnableVirtualizationBasedSecurity
+                    if ($vbsEnabled -eq 1) {
+                        & $emit 'UEFI' (& $toSev $sevDeviceGuardVbs) 'Virtualization-Based Security (VBS) is enabled in DeviceGuard registry'
+                    }
+                    $platReq = $dgProps.RequirePlatformSecurityFeatures
+                    if ($null -ne $platReq -and $platReq -ge 3) {
+                        & $emit 'UEFI' (& $toSev $sevDeviceGuardPlatReq) "DeviceGuard RequirePlatformSecurityFeatures=$platReq (requires Secure Boot + DMA protection) - not all Azure VM sizes support DMA protection; may prevent VBS from starting"
+                    }
+                    elseif ($null -ne $platReq -and $platReq -ge 1) {
+                        & $emit 'UEFI' 'OK' "DeviceGuard RequirePlatformSecurityFeatures=$platReq (Secure Boot only)"
+                    }
+                }
+
+                # HVCI (Hypervisor-enforced Code Integrity)
+                $hvciPath = "$ctrlRoot\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
+                if (Test-Path $hvciPath) {
+                    $hvciEnabled = (Get-ItemProperty $hvciPath -ErrorAction SilentlyContinue).Enabled
+                    if ($hvciEnabled -eq 1) {
+                        & $emit 'UEFI' (& $toSev $sevHvciEnabled) 'HVCI (Hypervisor-enforced Code Integrity) is enabled - unsigned kernel drivers will be blocked at runtime'
+                    }
+                }
+
+                # Early Launch Anti-Malware driver load policy
+                $elamPath = "$ctrlRoot\EarlyLaunch"
+                if (Test-Path $elamPath) {
+                    $driverLoadPolicy = (Get-ItemProperty $elamPath -ErrorAction SilentlyContinue).DriverLoadPolicy
+                    if ($null -ne $driverLoadPolicy) {
+                        $policyDesc = switch ([int]$driverLoadPolicy) {
+                            1 { 'Good only - unknown/bad boot drivers will be blocked' }
+                            3 { 'Good and unknown' }
+                            7 { 'Good, unknown, and bad (but not malicious)' }
+                            8 { 'All drivers allowed' }
+                            default { "Value=$driverLoadPolicy" }
+                        }
+                        if ([int]$driverLoadPolicy -eq 1) {
+                            & $emit 'UEFI' (& $toSev $sevEarlyLaunchPolicy) "EarlyLaunch DriverLoadPolicy=$driverLoadPolicy ($policyDesc) - restrictive policy may block third-party boot drivers"
+                        }
+                        else {
+                            & $emit 'UEFI' 'OK' "EarlyLaunch DriverLoadPolicy=$driverLoadPolicy ($policyDesc)"
+                        }
+                    }
+                }
+
+                # TPM driver state (relevant for vTPM-dependent features)
+                $tpmSvcPath = "$svcRoot\TPM"
+                if (Test-Path $tpmSvcPath) {
+                    $tpmStart = (Get-ItemProperty $tpmSvcPath -ErrorAction SilentlyContinue).Start
+                    if ($tpmStart -eq 4) {
+                        & $emit 'UEFI' (& $toSev $sevTpmDriverDisabled) 'TPM service is DISABLED (Start=4) - vTPM-dependent features (BitLocker auto-unlock, Windows Hello, attestation) will not function'
+                    }
+                }
+            }
+
+            # ── Static DNS ───────────────────────────────────────────────────────
+            $ifBase = "$SystemRoot\Services\Tcpip\Parameters\Interfaces"
+            if (Test-Path $ifBase) {
+                $staticDns = [System.Collections.Generic.List[string]]::new()
+                Get-ChildItem $ifBase -ErrorAction SilentlyContinue | ForEach-Object {
+                    $ns = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).NameServer
+                    if ($ns) { $staticDns.Add("$($_.PSChildName): $ns") }
+                }
+                $globalNs = (Get-ItemProperty "$SystemRoot\Services\Tcpip\Parameters" -ErrorAction SilentlyContinue).NameServer
+                if ($globalNs) { $staticDns.Add("Global: $globalNs") }
+                if ($staticDns.Count -gt 0) {
+                    & $emit 'Networking' (& $toSev $sevStaticDns) "Static DNS server(s) configured on $($staticDns.Count) interface(s) - may not resolve after migration; -ResetNetworkStack clears them" "-ResetNetworkStack"
+                }
+            }
+
+            # ── EMS / Serial Console ─────────────────────────────────────────────
+            # Check BCD for EMS (done outside hive, but while we're still here)
         } # end & { } child scope — all registry variables die here
     }
-    catch { Write-Warning "SYSTEM hive check error: $_" }
-    finally { UnmountOffHive -Hive 'SYSTEM' }
 
     # EMS / Serial Console check (reads BCD store; no hive needed)
     try {
@@ -4198,174 +4135,202 @@ function RunSystemCheck {
             $emsOut = & bcdedit.exe /store $bcdPathEms /enum "{emssettings}" 2>&1 | Out-String
             if ($emsOut -notmatch 'emsport' -and $emsOut -notmatch 'emsbaudrate') {
                 & $emit 'Boot' (& $toSev $sevEmsDisabled) 'EMS/Serial Console is not configured - enable with -EnableSerialConsole for Azure Serial Console access' "-EnableSerialConsole"
-            } else {
+            }
+            else {
                 & $emit 'Boot' 'OK' 'EMS/Serial Console is configured'
             }
         }
-    } catch { <# non-critical #> }
+    }
+    catch { <# non-critical #> }
 
     # ── 5. SOFTWARE hive ─────────────────────────────────────────────────────
     Write-Host "--- Registry (SOFTWARE hive)" -ForegroundColor DarkGray
-    MountOffHive -WinPath $OfflineWindowsPath -Hive 'SOFTWARE'
-    try {
+    Invoke-WithHive 'SOFTWARE' {
         # Child scope: all variables holding registry data die when this block returns,
         # releasing .NET RegistryKey handles before the finally block calls UnmountOffHive.
         & {
-        # OS edition & build
-        $ntCv = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
-        if ($ntCv) {
-            $build = if ($ntCv.CurrentBuildNumber) { "Build $($ntCv.CurrentBuildNumber).$($ntCv.UBR)" } else { '' }
-            & $emit 'OS' 'INFO' "$($ntCv.ProductName)  |  Edition: $($ntCv.EditionID)  |  $build"
-        }
-
-        # CredSSP AllowEncryptionOracle
-        $credSsp = (Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' -ErrorAction SilentlyContinue).AllowEncryptionOracle
-        if ($null -ne $credSsp -and $credSsp -ne 2) {
-            $oDesc = switch ($credSsp) { 0 {'Force Updated Clients (most restrictive)'} 1 {'Mitigated'} default {"Value=$credSsp"} }
-            & $emit 'RDP' (& $toSev $sevCredSspOracle) "CredSSP AllowEncryptionOracle=$credSsp ($oDesc) - may block RDP from clients without latest patches" "-FixRDPAuth"
-        }
-
-        # AppLocker enforced collections
-        $srpBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\SrpV2'
-        $enforced = @(foreach ($col in @('Exe','Dll','Script','Msi','Appx')) {
-            $colPath = "$srpBase\$col"
-            if ((Test-Path $colPath) -and (Get-ItemProperty $colPath -ErrorAction SilentlyContinue).EnforcementMode -ne 0) { $col }
-        })
-        if ($enforced.Count -gt 0) {
-            & $emit 'Security' (& $toSev $sevAppLockerEnforcing) "AppLocker is enforcing rules for: $($enforced -join ', ') - may block processes from starting" "-DisableAppLocker"
-        } else {
-            & $emit 'Security' 'OK' 'AppLocker is not enforcing any rule collections'
-        }
-
-        # AppIDSvc - if enforcing above, check service state
-        # (service state is in SYSTEM hive, checked there; this just notes correlation)
-
-        # NLA policy via Group Policy / TS Policy path (SOFTWARE side)
-        $tsPolicyBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-        if (Test-Path $tsPolicyBase) {
-            $tsPol = Get-ItemProperty $tsPolicyBase -ErrorAction SilentlyContinue
-            if ($null -ne $tsPol.fDenyTSConnections -and $tsPol.fDenyTSConnections -eq 1) {
-                & $emit 'RDP' (& $toSev $sevGpRdpBlocked) 'Group Policy is BLOCKING RDP: Software\Policies\...\Terminal Services fDenyTSConnections=1 - -FixRDP clears this' "-FixRDP"
+            # OS edition & build
+            $ntCv = Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+            if ($ntCv) {
+                $build = if ($ntCv.CurrentBuildNumber) { "Build $($ntCv.CurrentBuildNumber).$($ntCv.UBR)" } else { '' }
+                & $emit 'OS' 'INFO' "$($ntCv.ProductName)  |  Edition: $($ntCv.EditionID)  |  $build"
             }
-            if ($null -ne $tsPol.UserAuthentication -and $tsPol.UserAuthentication -eq 0) {
-                & $emit 'RDP' (& $toSev $sevGpNlaDisabled) 'Group Policy has disabled NLA (Software\Policies UserAuthentication=0) - this overrides the listener setting'
+
+            # CredSSP AllowEncryptionOracle
+            $credSsp = (Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\CredSSP\Parameters' -ErrorAction SilentlyContinue).AllowEncryptionOracle
+            if ($null -ne $credSsp -and $credSsp -ne 2) {
+                $oDesc = switch ($credSsp) { 0 { 'Force Updated Clients (most restrictive)' } 1 { 'Mitigated' } default { "Value=$credSsp" } }
+                & $emit 'RDP' (& $toSev $sevCredSspOracle) "CredSSP AllowEncryptionOracle=$credSsp ($oDesc) - may block RDP from clients without latest patches" "-FixRDPAuth"
             }
-            $sslFuncPath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'
-            if (Test-Path $sslFuncPath) {
-                $sslFunc = (Get-ItemProperty $sslFuncPath -ErrorAction SilentlyContinue).Functions
-                if ($null -ne $sslFunc) {
-                    & $emit 'RDP' (& $toSev $sevSslCipherPolicy) "SSL cipher suite policy (SSL\00010002 Functions) is configured - may restrict TLS cipher suites available to RDP; run -FixRDP to clear" "-FixRDP"
+
+            # ── Gen2: BitLocker / FVE policy (SOFTWARE hive side) ────────────────
+            if ($script:VMGen -eq 2) {
+                $fvePath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\FVE'
+                if (Test-Path $fvePath) {
+                    $fveProps = Get-ItemProperty $fvePath -ErrorAction SilentlyContinue
+                    $useTPM = $fveProps.UseTPM
+                    $useTPMPIN = $fveProps.UseTPMPIN
+                    $useTPMKey = $fveProps.UseTPMKey
+                    $fveDetail = [System.Collections.Generic.List[string]]::new()
+                    if ($null -ne $useTPM) { $fveDetail.Add("UseTPM=$useTPM") }
+                    if ($null -ne $useTPMPIN) { $fveDetail.Add("UseTPMPIN=$useTPMPIN") }
+                    if ($null -ne $useTPMKey) { $fveDetail.Add("UseTPMKey=$useTPMKey") }
+                    if ($fveDetail.Count -gt 0) {
+                        & $emit 'UEFI' (& $toSev $sevBitLockerActive) "BitLocker FVE policy configured ($($fveDetail -join ', ')) - if BitLocker is active with TPM protector, the disk CANNOT auto-unlock on a different VM; a recovery key is required"
+                    }
+                }
+                # Check if BitLocker volume encryption was active via SYSTEM hive marker
+                # FVE filter driver at boot-start is a strong indicator
+                # (fvevol is already tracked in device class filters; emit a targeted Gen2 warning here)
+                $fveVolPath = 'HKLM:\BROKENSOFTWARE\Microsoft\BitLocker'
+                if (Test-Path $fveVolPath) {
+                    & $emit 'UEFI' (& $toSev $sevBitLockerActive) 'BitLocker configuration key found (SOFTWARE\\Microsoft\\BitLocker) - if volume is encrypted with vTPM protector, moving the disk or recreating the VM will require the BitLocker recovery key'
                 }
             }
-        }
 
-        # CBS / Component Based Servicing pending state
-        $cbsBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
-        $cbsIssues = [System.Collections.Generic.List[string]]::new()
-        foreach ($cbsKey in @('RebootPending','PackagesPending','SessionsPending')) {
-            $cbsKeyPath = "$cbsBase\$cbsKey"
-            if (-not (Test-Path $cbsKeyPath)) { continue }
+            # AppLocker enforced collections
+            $srpBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\SrpV2'
+            $enforced = @(foreach ($col in @('Exe', 'Dll', 'Script', 'Msi', 'Appx')) {
+                    $colPath = "$srpBase\$col"
+                    if ((Test-Path $colPath) -and (Get-ItemProperty $colPath -ErrorAction SilentlyContinue).EnforcementMode -ne 0) { $col }
+                })
+            if ($enforced.Count -gt 0) {
+                & $emit 'Security' (& $toSev $sevAppLockerEnforcing) "AppLocker is enforcing rules for: $($enforced -join ', ') - may block processes from starting" "-DisableAppLocker"
+            }
+            else {
+                & $emit 'Security' 'OK' 'AppLocker is not enforcing any rule collections'
+            }
 
-            # Collect detail: subkey names + any values on the key itself
-            $subkeys = @(Get-ChildItem $cbsKeyPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
-            $vals    = Get-ItemProperty $cbsKeyPath -ErrorAction SilentlyContinue
-            $valNames = @($vals.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | Select-Object -ExpandProperty Name)
+            # AppIDSvc - if enforcing above, check service state
+            # (service state is in SYSTEM hive, checked there; this just notes correlation)
 
-            $detail = switch ($cbsKey) {
-                'RebootPending' {
-                    # Values here are package names pending reboot
-                    if ($valNames.Count -gt 0) { "pending package(s): $($valNames[0..([Math]::Min(2,$valNames.Count-1))] -join ', ')$(if ($valNames.Count -gt 3){ " (+$($valNames.Count-3) more)" })" }
-                    else { 'key exists (no values)' }
+            # NLA policy via Group Policy / TS Policy path (SOFTWARE side)
+            $tsPolicyBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+            if (Test-Path $tsPolicyBase) {
+                $tsPol = Get-ItemProperty $tsPolicyBase -ErrorAction SilentlyContinue
+                if ($null -ne $tsPol.fDenyTSConnections -and $tsPol.fDenyTSConnections -eq 1) {
+                    & $emit 'RDP' (& $toSev $sevGpRdpBlocked) 'Group Policy is BLOCKING RDP: Software\Policies\...\Terminal Services fDenyTSConnections=1 - -FixRDP clears this' "-FixRDP"
                 }
-                'PackagesPending' {
-                    # Subkeys are package names
-                    if ($subkeys.Count -gt 0) { "$($subkeys.Count) package(s) pending: $($subkeys[0..([Math]::Min(1,$subkeys.Count-1))] -join ', ')$(if ($subkeys.Count -gt 2){ " (+$($subkeys.Count-2) more)" })" }
-                    else { 'key exists (no subkeys)' }
+                if ($null -ne $tsPol.UserAuthentication -and $tsPol.UserAuthentication -eq 0) {
+                    & $emit 'RDP' (& $toSev $sevGpNlaDisabled) 'Group Policy has disabled NLA (Software\Policies UserAuthentication=0) - this overrides the listener setting'
                 }
-                'SessionsPending' {
-                    # Each subkey is a CBS session; the Exclusive value indicates a locked session
-                    $exclusive = @($subkeys | Where-Object {
-                        $sv = (Get-ItemProperty "$cbsKeyPath\$_" -ErrorAction SilentlyContinue).Exclusive
-                        $null -ne $sv -and $sv -ne 0
-                    })
-                    if ($exclusive.Count -gt 0) {
-                        "EXCLUSIVE session lock(s) present - a CBS operation was interrupted mid-flight; session ID(s): $($exclusive -join ', ')"
-                    } elseif ($subkeys.Count -gt 0) {
-                        "$($subkeys.Count) session entry(s) - likely a previous CBS transaction that did not complete cleanly; session ID(s): $($subkeys -join ', ')"
-                    } else {
-                        'key exists (no subkeys) - stale CBS session marker'
+                $sslFuncPath = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'
+                if (Test-Path $sslFuncPath) {
+                    $sslFunc = (Get-ItemProperty $sslFuncPath -ErrorAction SilentlyContinue).Functions
+                    if ($null -ne $sslFunc) {
+                        & $emit 'RDP' (& $toSev $sevSslCipherPolicy) "SSL cipher suite policy (SSL\00010002 Functions) is configured - may restrict TLS cipher suites available to RDP; run -FixRDP to clear" "-FixRDP"
                     }
                 }
             }
-            $cbsIssues.Add("$cbsKey ($detail)")
-        }
-        if ($cbsIssues.Count -gt 0) {
-            foreach ($issue in $cbsIssues) {
-                # SessionsPending without Exclusive locks is normal on healthy systems — emit INFO only
-                $isSessionInfo = ($issue -match '^SessionsPending' -and $issue -notmatch 'EXCLUSIVE')
-                $level = if ($isSessionInfo) { (& $toSev $sevCbsPendingInfo) } else { (& $toSev $sevCbsPendingWarn) }
-                $suffix = if ($isSessionInfo) { ' (stale entries, no exclusive lock - normal on healthy systems)' } else { " - may cause 'Configuring Windows Updates' boot loop" }
-                $fix   = if ($isSessionInfo) { $null } else { '-FixPendingUpdates' }
-                & $emit 'WindowsUpdate' $level "CBS pending state: $issue$suffix" $fix
-            }
-        } else {
-            & $emit 'WindowsUpdate' 'OK' 'No CBS pending state keys detected'
-        }
 
-        # ── Winlogon Shell / Userinit ────────────────────────────────────────
-        $wlPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-        if (Test-Path $wlPath) {
-            $wlProps     = Get-ItemProperty $wlPath -ErrorAction SilentlyContinue
-            $wlShell     = $wlProps.Shell
-            $wlUserinit  = $wlProps.Userinit
-            if ($wlShell -and $wlShell -ne 'explorer.exe') {
-                & $emit 'Security' (& $toSev $sevWinlogonShell) "Winlogon Shell is '$wlShell' (expected 'explorer.exe') - will cause black screen or wrong shell on logon" "-FixWinlogon"
-            }
-            $expectedUi = 'C:\Windows\system32\userinit.exe,'
-            if ($wlUserinit -and $wlUserinit -ne $expectedUi -and $wlUserinit -ne 'C:\Windows\system32\userinit.exe') {
-                & $emit 'Security' (& $toSev $sevWinlogonUserinit) "Winlogon Userinit is '$wlUserinit' (expected default) - may cause logon failure or malware execution" "-FixWinlogon"
-            }
-        }
+            # CBS / Component Based Servicing pending state
+            $cbsBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
+            $cbsIssues = [System.Collections.Generic.List[string]]::new()
+            foreach ($cbsKey in @('RebootPending', 'PackagesPending', 'SessionsPending')) {
+                $cbsKeyPath = "$cbsBase\$cbsKey"
+                if (-not (Test-Path $cbsKeyPath)) { continue }
 
-        # ── User Profile List ────────────────────────────────────────────────
-        $plBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
-        if (Test-Path $plBase) {
-            $profEntries = Get-ChildItem $plBase -ErrorAction SilentlyContinue
-            foreach ($pf in $profEntries) {
-                $sid = $pf.PSChildName
-                if ($sid -notmatch '^S-1-5-21-') { continue }
-                $bakProfPath = "$plBase\$sid.bak"
-                if (Test-Path $bakProfPath) {
-                    $pfPath = (Get-ItemProperty $pf.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
-                    & $emit 'UserProfile' (& $toSev $sevProfileBak) "Profile SID $sid has .bak duplicate (path: $pfPath) - user will get 'The User Profile Service failed the sign-in' error" "-FixProfileLoad"
+                # Collect detail: subkey names + any values on the key itself
+                $subkeys = @(Get-ChildItem $cbsKeyPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
+                $vals = Get-ItemProperty $cbsKeyPath -ErrorAction SilentlyContinue
+                $valNames = @($vals.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | Select-Object -ExpandProperty Name)
+
+                $detail = switch ($cbsKey) {
+                    'RebootPending' {
+                        # Values here are package names pending reboot
+                        if ($valNames.Count -gt 0) { "pending package(s): $($valNames[0..([Math]::Min(2,$valNames.Count-1))] -join ', ')$(if ($valNames.Count -gt 3){ " (+$($valNames.Count-3) more)" })" }
+                        else { 'key exists (no values)' }
+                    }
+                    'PackagesPending' {
+                        # Subkeys are package names
+                        if ($subkeys.Count -gt 0) { "$($subkeys.Count) package(s) pending: $($subkeys[0..([Math]::Min(1,$subkeys.Count-1))] -join ', ')$(if ($subkeys.Count -gt 2){ " (+$($subkeys.Count-2) more)" })" }
+                        else { 'key exists (no subkeys)' }
+                    }
+                    'SessionsPending' {
+                        # Each subkey is a CBS session; the Exclusive value indicates a locked session
+                        $exclusive = @($subkeys | Where-Object {
+                                $sv = (Get-ItemProperty "$cbsKeyPath\$_" -ErrorAction SilentlyContinue).Exclusive
+                                $null -ne $sv -and $sv -ne 0
+                            })
+                        if ($exclusive.Count -gt 0) {
+                            "EXCLUSIVE session lock(s) present - a CBS operation was interrupted mid-flight; session ID(s): $($exclusive -join ', ')"
+                        }
+                        elseif ($subkeys.Count -gt 0) {
+                            "$($subkeys.Count) session entry(s) - likely a previous CBS transaction that did not complete cleanly; session ID(s): $($subkeys -join ', ')"
+                        }
+                        else {
+                            'key exists (no subkeys) - stale CBS session marker'
+                        }
+                    }
                 }
-                $pfState = (Get-ItemProperty $pf.PSPath -ErrorAction SilentlyContinue).State
-                if ($null -ne $pfState -and ($pfState -band 0x8)) {
-                    & $emit 'UserProfile' (& $toSev $sevProfileTempFlag) "Profile SID $sid has temporary profile flag (State=$pfState) - user gets temporary profile on each logon" "-FixProfileLoad"
+                $cbsIssues.Add("$cbsKey ($detail)")
+            }
+            if ($cbsIssues.Count -gt 0) {
+                foreach ($issue in $cbsIssues) {
+                    # SessionsPending without Exclusive locks is normal on healthy systems — emit INFO only
+                    $isSessionInfo = ($issue -match '^SessionsPending' -and $issue -notmatch 'EXCLUSIVE')
+                    $level = if ($isSessionInfo) { (& $toSev $sevCbsPendingInfo) } else { (& $toSev $sevCbsPendingWarn) }
+                    $suffix = if ($isSessionInfo) { ' (stale entries, no exclusive lock - normal on healthy systems)' } else { " - may cause 'Configuring Windows Updates' boot loop" }
+                    $fix = if ($isSessionInfo) { $null } else { '-FixPendingUpdates' }
+                    & $emit 'WindowsUpdate' $level "CBS pending state: $issue$suffix" $fix
                 }
             }
-        }
-
-        # ── Startup Programs (Run/RunOnce) ───────────────────────────────────
-        $runPaths = @(
-            'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run'
-            'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
-        )
-        $startupEntries = [System.Collections.Generic.List[string]]::new()
-        foreach ($rp in $runPaths) {
-            if (-not (Test-Path $rp)) { continue }
-            $rpProps = Get-ItemProperty $rp -ErrorAction SilentlyContinue
-            foreach ($rpv in ($rpProps.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
-                $startupEntries.Add("$($rpv.Name)")
+            else {
+                & $emit 'WindowsUpdate' 'OK' 'No CBS pending state keys detected'
             }
-        }
-        if ($startupEntries.Count -gt 0) {
-            & $emit 'Startup' (& $toSev $sevStartupPrograms) "$($startupEntries.Count) auto-start entry(s) in HKLM Run/RunOnce: $($startupEntries -join ', ') - use -ListStartupPrograms to review" "-ListStartupPrograms"
-        }
+
+            # ── Winlogon Shell / Userinit ────────────────────────────────────────
+            $wlPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+            if (Test-Path $wlPath) {
+                $wlProps = Get-ItemProperty $wlPath -ErrorAction SilentlyContinue
+                $wlShell = $wlProps.Shell
+                $wlUserinit = $wlProps.Userinit
+                if ($wlShell -and $wlShell -ne 'explorer.exe') {
+                    & $emit 'Security' (& $toSev $sevWinlogonShell) "Winlogon Shell is '$wlShell' (expected 'explorer.exe') - will cause black screen or wrong shell on logon" "-FixWinlogon"
+                }
+                $expectedUi = 'C:\Windows\system32\userinit.exe,'
+                if ($wlUserinit -and $wlUserinit -ne $expectedUi -and $wlUserinit -ne 'C:\Windows\system32\userinit.exe') {
+                    & $emit 'Security' (& $toSev $sevWinlogonUserinit) "Winlogon Userinit is '$wlUserinit' (expected default) - may cause logon failure or malware execution" "-FixWinlogon"
+                }
+            }
+
+            # ── User Profile List ────────────────────────────────────────────────
+            $plBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+            if (Test-Path $plBase) {
+                $profEntries = Get-ChildItem $plBase -ErrorAction SilentlyContinue
+                foreach ($pf in $profEntries) {
+                    $sid = $pf.PSChildName
+                    if ($sid -notmatch '^S-1-5-21-') { continue }
+                    $bakProfPath = "$plBase\$sid.bak"
+                    if (Test-Path $bakProfPath) {
+                        $pfPath = (Get-ItemProperty $pf.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+                        & $emit 'UserProfile' (& $toSev $sevProfileBak) "Profile SID $sid has .bak duplicate (path: $pfPath) - user will get 'The User Profile Service failed the sign-in' error" "-FixProfileLoad"
+                    }
+                    $pfState = (Get-ItemProperty $pf.PSPath -ErrorAction SilentlyContinue).State
+                    if ($null -ne $pfState -and ($pfState -band 0x8)) {
+                        & $emit 'UserProfile' (& $toSev $sevProfileTempFlag) "Profile SID $sid has temporary profile flag (State=$pfState) - user gets temporary profile on each logon" "-FixProfileLoad"
+                    }
+                }
+            }
+
+            # ── Startup Programs (Run/RunOnce) ───────────────────────────────────
+            $runPaths = @(
+                'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+                'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+            )
+            $startupEntries = [System.Collections.Generic.List[string]]::new()
+            foreach ($rp in $runPaths) {
+                if (-not (Test-Path $rp)) { continue }
+                $rpProps = Get-ItemProperty $rp -ErrorAction SilentlyContinue
+                foreach ($rpv in ($rpProps.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+                    $startupEntries.Add("$($rpv.Name)")
+                }
+            }
+            if ($startupEntries.Count -gt 0) {
+                & $emit 'Startup' (& $toSev $sevStartupPrograms) "$($startupEntries.Count) auto-start entry(s) in HKLM Run/RunOnce: $($startupEntries -join ', ') - use -ListStartupPrograms to review" "-ListStartupPrograms"
+            }
         } # end & { } child scope — all registry variables die here
     }
-    catch { Write-Warning "SOFTWARE hive check error: $_" }
-    finally { UnmountOffHive -Hive 'SOFTWARE' }
 
     # ── 6. Azure Agent binaries on disk ──────────────────────────────────────
     Write-Host "--- Azure VM Agent" -ForegroundColor DarkGray
@@ -4374,10 +4339,12 @@ function RunSystemCheck {
         $gaDirs = @(Get-ChildItem $azureDir -Filter 'GuestAgent_*' -Directory -ErrorAction SilentlyContinue)
         if ($gaDirs.Count -gt 0) {
             & $emit 'AzureAgent' 'OK' "Agent binaries present: $($gaDirs[-1].Name)"
-        } else {
+        }
+        else {
             & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) 'WindowsAzure folder exists but no GuestAgent_* subfolder found' "-InstallAzureVMAgent"
         }
-    } else {
+    }
+    else {
         & $emit 'AzureAgent' (& $toSev $sevAzureAgentMissing) "WindowsAzure folder not found on $script:WinDriveLetter - VM Agent may not be installed" "-InstallAzureVMAgent"
     }
 
@@ -4396,16 +4363,16 @@ function RunSystemCheck {
             #   S-1-5-80-* matching SessionEnv service  -> needs FullControl (checked by display name)
             try {
                 $keyAcl = Get-Acl -Path $rdpKeyFiles[0].FullName -ErrorAction Stop
-                $rules  = $keyAcl.Access
+                $rules = $keyAcl.Access
 
-                $sidSystem  = [System.Security.Principal.SecurityIdentifier]'S-1-5-18'
-                $sidNetSvc  = [System.Security.Principal.SecurityIdentifier]'S-1-5-20'
+                $sidSystem = [System.Security.Principal.SecurityIdentifier]'S-1-5-18'
+                $sidNetSvc = [System.Security.Principal.SecurityIdentifier]'S-1-5-20'
 
-                $systemOk  = $rules | Where-Object {
+                $systemOk = $rules | Where-Object {
                     try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -eq $sidSystem } catch { $false }
                 } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl }
 
-                $netSvcOk  = $rules | Where-Object {
+                $netSvcOk = $rules | Where-Object {
                     try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -eq $sidNetSvc } catch { $false }
                 } | Where-Object { $_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read }
 
@@ -4419,16 +4386,19 @@ function RunSystemCheck {
                 }
                 if (-not $netSvcOk) {
                     & $emit 'RDP' (& $toSev $sevRdpKeyNetSvcAcl) "RDP private key: NT AUTHORITY\NETWORK SERVICE does not have Read access - TermService will fail to load the RDP certificate" "-FixRDPPermissions"
-                } else {
+                }
+                else {
                     & $emit 'RDP' 'OK' 'RDP private key ACLs: SYSTEM and NETWORK SERVICE have required permissions'
                 }
                 if (-not $sessionEnvOk) {
                     & $emit 'RDP' (& $toSev $sevRdpKeySessionEnvAcl) 'RDP private key: NT Service\SessionEnv FullControl not found - may cause RDP session issues on some Windows versions' "-FixRDPPermissions"
                 }
-            } catch {
+            }
+            catch {
                 & $emit 'RDP' 'INFO' "Could not read ACLs on RDP private key file: $_"
             }
-        } else {
+        }
+        else {
             & $emit 'RDP' (& $toSev $sevRdpKeyFileMissing) 'RDP private key file (f686aace...) not found in MachineKeys - RDP certificate will need to be regenerated' "-FixRDPCert"
         }
         # Check for zero-length or suspiciously small key files (corrupted)
@@ -4436,7 +4406,8 @@ function RunSystemCheck {
         if ($emptyKeys.Count -gt 0) {
             & $emit 'RDP' (& $toSev $sevRdpKeyZeroLength) "$($emptyKeys.Count) zero-length file(s) found in MachineKeys - may indicate corrupted key store; run -FixRDPPermissions" "-FixRDPPermissions"
         }
-    } else {
+    }
+    else {
         & $emit 'RDP' (& $toSev $sevMachineKeysMissing) 'MachineKeys folder missing - RDP certificate operations will fail on boot' "-FixRDPPermissions"
     }
 
@@ -4444,7 +4415,7 @@ function RunSystemCheck {
     $crits = @($findings | Where-Object Severity -eq 'CRIT')
     $warns = @($findings | Where-Object Severity -eq 'WARN')
     $infos = @($findings | Where-Object Severity -eq 'INFO')
-    $oks   = @($findings | Where-Object Severity -eq 'OK')
+    $oks = @($findings | Where-Object Severity -eq 'OK')
 
     Write-Host "`n===================================================================" -ForegroundColor Cyan
     Write-Host "  System Check Summary  -  $($crits.Count) critical  /  $($warns.Count) warnings  /  $($infos.Count) info  /  $($oks.Count) ok" -ForegroundColor Cyan
@@ -4478,9 +4449,7 @@ function RunSystemCheck {
 
 function ResetNetworkStack {
     Write-Host "Placing network stack reset script to run at next boot..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Setup" -Name SetupType -Value 2 -Type DWord -Force
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Setup" -Name CmdLine -Value "cmd.exe /c c:\temp\resetnet.cmd" -Type String -Force
 
@@ -4502,14 +4471,15 @@ function ResetNetworkStack {
             }
             # Also clear the global NameServer override
             $tcpParams = "$SystemRoot\Services\Tcpip\Parameters"
-            $globalNs  = (Get-ItemProperty $tcpParams -ErrorAction SilentlyContinue).NameServer
+            $globalNs = (Get-ItemProperty $tcpParams -ErrorAction SilentlyContinue).NameServer
             if ($globalNs) {
                 Write-Host "  Global Tcpip\Parameters: clearing static DNS ($globalNs)" -ForegroundColor Yellow
                 Set-ItemProperty-Logged -Path $tcpParams -Name NameServer -Value '' -Type String -Force
             }
             if ($ifCount -gt 0 -or $globalNs) {
                 Write-Host "  DNS settings reset to DHCP defaults on $ifCount interface(s)." -ForegroundColor Green
-            } else {
+            }
+            else {
                 Write-Host "  No static DNS settings found (already using DHCP)." -ForegroundColor DarkGray
             }
         }
@@ -4534,20 +4504,11 @@ shutdown /r /t 10 /c "Network stack reset complete - rebooting"
 
         Write-Host "Network stack reset script placed. On next boot: IP stack, Winsock, firewall and DNS cache will be reset, then VM will reboot automatically." -ForegroundColor Green
     }
-    catch {
-        Write-Error "ResetNetworkStack failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 function DisableWindowsUpdate {
     Write-Host "Disabling Windows Update services to prevent boot loops from update processing..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
 
         $services = @('wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'UpdateOrchestrator')
@@ -4567,13 +4528,6 @@ function DisableWindowsUpdate {
         Write-Host "# Or use: sc.exe config wuauserv start= auto" -ForegroundColor DarkGray
         Write-Host "------------------------------------------------------`n" -ForegroundColor Cyan
     }
-    catch {
-        Write-Error "DisableWindowsUpdate failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 function RestoreRegistryFromRegBack {
@@ -4584,7 +4538,7 @@ The current hives and their transaction log files (.LOG/.LOG1/.LOG2) are renamed
 
     Write-Host "Attempting to restore SYSTEM and SOFTWARE hives from RegBack..." -ForegroundColor Yellow
     $regBackPath = Join-Path $script:WinDriveLetter "Windows\System32\config\RegBack"
-    $configPath  = Join-Path $script:WinDriveLetter "Windows\System32\config"
+    $configPath = Join-Path $script:WinDriveLetter "Windows\System32\config"
 
     if (-not (Test-Path $regBackPath)) {
         Write-Warning "RegBack folder not found at $regBackPath. Cannot restore."
@@ -4594,7 +4548,7 @@ The current hives and their transaction log files (.LOG/.LOG1/.LOG2) are renamed
     $hives = @('SYSTEM', 'SOFTWARE')
     foreach ($hive in $hives) {
         $backupFile = Join-Path $regBackPath $hive
-        $liveFile   = Join-Path $configPath  $hive
+        $liveFile = Join-Path $configPath  $hive
 
         if (-not (Test-Path $backupFile)) {
             Write-Warning "  RegBack copy of $hive not found - skipping."
@@ -4671,14 +4625,14 @@ function CheckDiskHealth {
     foreach ($p in $partitions) {
         $sizeMB = [math]::Round($p.Size / 1MB)
         $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { "(no letter)" }
-        $vol    = Get-Volume -Partition $p -ErrorAction SilentlyContinue
-        $fs     = if ($vol) { $vol.FileSystemType } else { "N/A" }
+        $vol = Get-Volume -Partition $p -ErrorAction SilentlyContinue
+        $fs = if ($vol) { $vol.FileSystemType } else { "N/A" }
         $health = if ($vol) { $vol.HealthStatus } else { "N/A" }
-        $raw    = if ($fs -eq 'Unknown' -or $fs -eq '') { " !!! RAW FILESYSTEM - data may be inaccessible" } else { "" }
+        $raw = if ($fs -eq 'Unknown' -or $fs -eq '') { " !!! RAW FILESYSTEM - data may be inaccessible" } else { "" }
 
-        $color  = if ($raw) { 'Red' } elseif ($health -ne 'Healthy' -and $health -ne 'N/A') { 'Yellow' } else { 'White' }
+        $color = if ($raw) { 'Red' } elseif ($health -ne 'Healthy' -and $health -ne 'N/A') { 'Yellow' } else { 'White' }
         Write-Host ("  Partition {0,2}: {1,-10} | {2,-12} | {3} MB | FS: {4,-8} | Health: {5}{6}" -f `
-            $p.PartitionNumber, $letter, $p.Type, $sizeMB, $fs, $health, $raw) -ForegroundColor $color
+                $p.PartitionNumber, $letter, $p.Type, $sizeMB, $fs, $health, $raw) -ForegroundColor $color
     }
     Write-Host ""
     Write-Host "Windows drive : $script:WinDriveLetter"  -ForegroundColor Green
@@ -4697,13 +4651,13 @@ function CollectEventLogs {
     Write-Host "Collecting guest event logs to $destFolder ..." -ForegroundColor Yellow
 
     $logSources = @(
-        @{ Src = "$script:WinDriveLetter\Windows\System32\winevt\Logs\System.evtx";      Dst = "System.evtx" },
+        @{ Src = "$script:WinDriveLetter\Windows\System32\winevt\Logs\System.evtx"; Dst = "System.evtx" },
         @{ Src = "$script:WinDriveLetter\Windows\System32\winevt\Logs\Application.evtx"; Dst = "Application.evtx" },
-        @{ Src = "$script:WinDriveLetter\Windows\System32\winevt\Logs\Security.evtx";    Dst = "Security.evtx" },
-        @{ Src = "$script:WinDriveLetter\Windows\inf\setupapi.dev.log";                  Dst = "setupapi.dev.log" },
-        @{ Src = "$script:WinDriveLetter\Windows\inf\setupapi.setup.log";                Dst = "setupapi.setup.log" },
-        @{ Src = "$script:WinDriveLetter\Windows\ntbtlog.txt";                           Dst = "ntbtlog.txt" },
-        @{ Src = "$script:WinDriveLetter\Windows\Minidump";                              Dst = "Minidump" }
+        @{ Src = "$script:WinDriveLetter\Windows\System32\winevt\Logs\Security.evtx"; Dst = "Security.evtx" },
+        @{ Src = "$script:WinDriveLetter\Windows\inf\setupapi.dev.log"; Dst = "setupapi.dev.log" },
+        @{ Src = "$script:WinDriveLetter\Windows\inf\setupapi.setup.log"; Dst = "setupapi.setup.log" },
+        @{ Src = "$script:WinDriveLetter\Windows\ntbtlog.txt"; Dst = "ntbtlog.txt" },
+        @{ Src = "$script:WinDriveLetter\Windows\Minidump"; Dst = "Minidump" }
     )
 
     foreach ($log in $logSources) {
@@ -4722,10 +4676,7 @@ function CollectEventLogs {
 }
 
 function ResetUserRights {
-    $OfflineWindowsPath = Join-Path $WinDriveLetter "Windows"
-
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         Write-Host "Configuring setup and adding script..." -ForegroundColor Green
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Setup" -Name SetupType -Value 2 -Type DWord -Force
         Set-ItemProperty-Logged -Path "HKLM:\BROKENSYSTEM\Setup" -Name CmdLine -Value "cmd.exe /c c:\temp\resetuserrights.cmd" -Type String -Force
@@ -4743,34 +4694,26 @@ del /F C:\temp\resetuserrights.cmd > NUL
         Ensure-GuestTempDir
         New-Item-Logged -Path "$WinDriveLetter\Temp" -Name "resetuserrights.cmd" -ItemType File -Value $resetuserrights.ToString().Trim() -Force
     }
-    catch {
-        Write-Error "ResetUserRights failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 function DisableDriverVerifier {
     Write-Host "Disabling Driver Verifier on offline guest..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
-        $mmPath     = "$SystemRoot\Control\Session Manager\Memory Management"
+        $mmPath = "$SystemRoot\Control\Session Manager\Memory Management"
         $verifyPath = "$SystemRoot\Services\VeriDrv"
 
         if (Test-Path $mmPath) {
             $verifyDrivers = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDrivers
-            $verifyLevel   = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDriverLevel
+            $verifyLevel = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDriverLevel
             if ($verifyDrivers -or $verifyLevel) {
                 Write-Host "  Current VerifyDrivers : $verifyDrivers" -ForegroundColor White
                 Write-Host "  Current VerifyDriverLevel : $verifyLevel" -ForegroundColor White
                 Set-ItemProperty-Logged -Path $mmPath -Name VerifyDrivers -Value '' -Type String -Force
                 Remove-ItemProperty-Logged -Path $mmPath -Name VerifyDriverLevel -ErrorAction SilentlyContinue
                 Write-Host "  [OK] Driver Verifier settings cleared." -ForegroundColor Green
-            } else {
+            }
+            else {
                 Write-Host "  Driver Verifier is not configured (VerifyDrivers and VerifyDriverLevel not set)." -ForegroundColor DarkGray
             }
         }
@@ -4786,23 +4729,14 @@ function DisableDriverVerifier {
 
         Write-Host "Driver Verifier disabled. The VM will no longer enforce verification on boot." -ForegroundColor Green
     }
-    catch {
-        Write-Error "DisableDriverVerifier failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
-    }
 }
 
 function EnableDriverVerifier {
     param([string]$DriverList)
     Write-Host "Enabling Driver Verifier on offline guest..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
-        $mmPath     = "$SystemRoot\Control\Session Manager\Memory Management"
+        $mmPath = "$SystemRoot\Control\Session Manager\Memory Management"
         $verifyPath = "$SystemRoot\Services\VeriDrv"
 
         if (-not (Test-Path $mmPath)) {
@@ -4813,7 +4747,8 @@ function EnableDriverVerifier {
         $drivers = if (-not [string]::IsNullOrWhiteSpace($DriverList)) {
             # User supplied specific drivers
             ($DriverList -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' '
-        } else {
+        }
+        else {
             # Default: verify all drivers
             '*'
         }
@@ -4825,7 +4760,7 @@ function EnableDriverVerifier {
 
         # Show current state
         $currentDrivers = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDrivers
-        $currentLevel   = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDriverLevel
+        $currentLevel = (Get-ItemProperty $mmPath -ErrorAction SilentlyContinue).VerifyDriverLevel
         if ($currentDrivers -or $currentLevel) {
             Write-Host "  Current VerifyDrivers     : $currentDrivers" -ForegroundColor DarkGray
             Write-Host "  Current VerifyDriverLevel : $currentLevel" -ForegroundColor DarkGray
@@ -4850,13 +4785,6 @@ function EnableDriverVerifier {
         if ($drivers -eq '*') {
             Write-Warning "All drivers will be verified. This may cause significant performance impact. Use -EnableDriverVerifier 'driver1.sys,driver2.sys' to target specific drivers."
         }
-    }
-    catch {
-        Write-Error "EnableDriverVerifier failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
     }
 }
 
@@ -4884,11 +4812,13 @@ function CollectMinidumps {
             $size = if ((Get-Item $src.Path).PSIsContainer) {
                 $files = @(Get-ChildItem $src.Path -Recurse -File -ErrorAction SilentlyContinue)
                 "$($files.Count) file(s), $([math]::Round(($files | Measure-Object -Property Length -Sum).Sum / 1MB, 1)) MB"
-            } else {
+            }
+            else {
                 "$([math]::Round((Get-Item $src.Path).Length / 1MB, 1)) MB"
             }
             Write-Host "  Copied: $($src.Desc) ($size)" -ForegroundColor Green
-        } else {
+        }
+        else {
             Write-Host "  Not found (skipped): $($src.Desc)" -ForegroundColor DarkGray
         }
     }
@@ -4896,7 +4826,8 @@ function CollectMinidumps {
     if ($anyFound) {
         Write-Host "Crash dumps collected to: $destFolder" -ForegroundColor Green
         Write-Host "Tip: Use WinDbg or 'dumpchk.exe <file.dmp>' to analyse crash dumps." -ForegroundColor DarkCyan
-    } else {
+    }
+    else {
         Write-Host "No crash dump files found on the guest disk." -ForegroundColor DarkGray
     }
 }
@@ -4922,28 +4853,27 @@ Domain-joined VMs will re-download GPOs on next gpupdate cycle.
             $items = @(Get-ChildItem $gp -Recurse -Force -ErrorAction SilentlyContinue)
             Remove-Item-Logged -Path "$gp\*" -Recurse -Force
             Write-Host "  Cleared: $gp ($($items.Count) items)" -ForegroundColor Green
-        } else {
+        }
+        else {
             Write-Host "  Not found (skipped): $gp" -ForegroundColor DarkGray
         }
     }
 
     # Clear cached policy keys in SOFTWARE hive
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
-        $polPath = 'HKLM:\BROKENSOFTWARE\Policies'
-        if (Test-Path $polPath) {
-            $subKeys = @(Get-ChildItem $polPath -ErrorAction SilentlyContinue)
-            if ($subKeys.Count -gt 0) {
-                foreach ($sk in $subKeys) {
-                    Remove-Item-Logged -Path $sk.PSPath -Recurse -Force
+    Invoke-WithHive 'SOFTWARE' {
+        & {
+            $polPath = 'HKLM:\BROKENSOFTWARE\Policies'
+            if (Test-Path $polPath) {
+                $subKeys = @(Get-ChildItem $polPath -ErrorAction SilentlyContinue)
+                if ($subKeys.Count -gt 0) {
+                    foreach ($sk in $subKeys) {
+                        Remove-Item-Logged -Path $sk.PSPath -Recurse -Force
+                    }
+                    Write-Host "  Cleared SOFTWARE\Policies ($($subKeys.Count) top-level keys)" -ForegroundColor Green
                 }
-                Write-Host "  Cleared SOFTWARE\Policies ($($subKeys.Count) top-level keys)" -ForegroundColor Green
             }
         }
     }
-    catch { Write-Warning "Failed to clear SOFTWARE\Policies: $_" }
-    finally { UnmountOffHive -Hive "SOFTWARE" }
 
     Write-Host "Group Policy reset complete. On next boot, local policies will be factory defaults." -ForegroundColor Green
     Write-Host "  Domain-joined VMs will re-apply domain GPOs on next Group Policy refresh." -ForegroundColor DarkCyan
@@ -4951,16 +4881,14 @@ Domain-joined VMs will re-download GPOs on next gpupdate cycle.
 
 function FixWinlogon {
     Write-Host "Resetting Winlogon shell and Userinit to Windows defaults..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
+    Invoke-WithHive 'SOFTWARE' {
         $wlPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         if (-not (Test-Path $wlPath)) {
             Write-Warning "Winlogon key not found at $wlPath."
             return
         }
 
-        $currentShell    = (Get-ItemProperty $wlPath -ErrorAction SilentlyContinue).Shell
+        $currentShell = (Get-ItemProperty $wlPath -ErrorAction SilentlyContinue).Shell
         $currentUserinit = (Get-ItemProperty $wlPath -ErrorAction SilentlyContinue).Userinit
 
         Write-Host "  Current Shell   : $currentShell" -ForegroundColor White
@@ -4984,20 +4912,11 @@ function FixWinlogon {
             Write-Host "  Winlogon Shell and Userinit are already at default values." -ForegroundColor DarkGray
         }
     }
-    catch {
-        Write-Error "FixWinlogon failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SOFTWARE"
-    }
 }
 
 function FixProfileLoad {
     Write-Host "Scanning user profile list for corrupted entries..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
+    Invoke-WithHive 'SOFTWARE' {
         $plBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
         if (-not (Test-Path $plBase)) {
             Write-Warning "ProfileList key not found."
@@ -5013,12 +4932,12 @@ function FixProfileLoad {
             if ($sid -notmatch '^S-1-5-21-') { continue }
 
             $bakPath = "$plBase\$sid.bak"
-            $hasBak  = Test-Path $bakPath
+            $hasBak = Test-Path $bakPath
 
             if ($hasBak) {
                 # The .bak duplicate is the corrupt one; the primary has the wrong profile
                 # Fix: rename primary to .old, rename .bak to primary
-                $props    = Get-ItemProperty $prof.PSPath -ErrorAction SilentlyContinue
+                $props = Get-ItemProperty $prof.PSPath -ErrorAction SilentlyContinue
                 $bakProps = Get-ItemProperty $bakPath -ErrorAction SilentlyContinue
                 Write-Host "  [FIX] SID $sid has a .bak duplicate (profile load failure pattern)" -ForegroundColor Yellow
                 Write-Host "        Primary ProfileImagePath: $($props.ProfileImagePath)" -ForegroundColor White
@@ -5045,7 +4964,8 @@ function FixProfileLoad {
                     Set-ItemProperty-Logged -Path $newPrimary -Name RefCount -Value 0 -Type DWord -Force
                 }
                 $fixCount++
-            } else {
+            }
+            else {
                 # Check for corrupt State (bit 3 = temporary profile)
                 $state = (Get-ItemProperty $prof.PSPath -ErrorAction SilentlyContinue).State
                 if ($null -ne $state -and ($state -band 0x8)) {
@@ -5060,23 +4980,17 @@ function FixProfileLoad {
 
         if ($fixCount -gt 0) {
             Write-Host "Fixed $fixCount profile entry(s). Users should be able to log on normally." -ForegroundColor Green
-        } else {
+        }
+        else {
             Write-Host "  No corrupted profile entries found. All profiles appear healthy." -ForegroundColor DarkGray
         }
-    }
-    catch {
-        Write-Error "FixProfileLoad failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SOFTWARE"
     }
 }
 
 function EnableSerialConsole {
     Write-Host "Enabling Emergency Management Services (EMS) / Serial Console..." -ForegroundColor Yellow
     try {
-        $storePath  = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter
+        $storePath = Get-BcdStorePath -Generation $script:VMGen -BootDrive $script:BootDriveLetter
         $identifier = Get-BcdBootLoaderId -StorePath $storePath
         if (-not $identifier) { return }
 
@@ -5101,10 +5015,8 @@ function EnableSerialConsole {
 
 function ListInstalledUpdates {
     Write-Host "Enumerating installed Windows Updates from offline guest disk..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
-        $cbsBase   = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages'
+    Invoke-WithHive 'SOFTWARE' {
+        $cbsBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages'
         if (-not (Test-Path $cbsBase)) {
             Write-Warning "CBS Packages key not found."
             return
@@ -5115,21 +5027,21 @@ function ListInstalledUpdates {
         }
 
         # Extract KB numbers and deduplicate
-        $kbList = [System.Collections.Generic.SortedDictionary[string,PSCustomObject]]::new()
+        $kbList = [System.Collections.Generic.SortedDictionary[string, PSCustomObject]]::new()
         foreach ($pkg in $packages) {
             if ($pkg.PSChildName -match '(KB\d+)') {
                 $kb = $Matches[1]
                 if ($kbList.ContainsKey($kb)) { continue }
                 $props = Get-ItemProperty $pkg.PSPath -ErrorAction SilentlyContinue
                 $state = switch ($props.CurrentState) {
-                    0   { 'Absent' }
-                    5   { 'Uninstall Pending' }
-                    16  { 'Resolving' }
-                    32  { 'Resolved' }
-                    48  { 'Staging' }
-                    64  { 'Staged' }
-                    80  { 'Superseded' }
-                    96  { 'Install Pending' }
+                    0 { 'Absent' }
+                    5 { 'Uninstall Pending' }
+                    16 { 'Resolving' }
+                    32 { 'Resolved' }
+                    48 { 'Staging' }
+                    64 { 'Staged' }
+                    80 { 'Superseded' }
+                    96 { 'Install Pending' }
                     101 { 'partially Installed' }
                     112 { 'Installed' }
                     128 { 'Permanent' }
@@ -5140,7 +5052,8 @@ function ListInstalledUpdates {
                     try {
                         $ft = ([long]$props.InstallTimeHigh -shl 32) -bor [long]$props.InstallTimeLow
                         if ($ft -gt 0) { $installDate = [datetime]::FromFileTimeUtc($ft).ToString('yyyy-MM-dd HH:mm') }
-                    } catch {}
+                    }
+                    catch {}
                 }
                 $kbList[$kb] = [PSCustomObject]@{
                     KB      = $kb
@@ -5161,28 +5074,21 @@ function ListInstalledUpdates {
         Write-Host ("  {0,-12} {1,-22} {2,-20} {3}" -f '----', '-----', '------------', '-------') -ForegroundColor DarkGray
         foreach ($entry in $kbList.Values) {
             $color = switch -Wildcard ($entry.State) {
-                'Installed'  { 'Green' }
-                'Permanent'  { 'Green' }
+                'Installed' { 'Green' }
+                'Permanent' { 'Green' }
                 'Superseded' { 'DarkGray' }
-                '*Pending*'  { 'Yellow' }
-                'Absent'     { 'DarkGray' }
-                default      { 'White' }
+                '*Pending*' { 'Yellow' }
+                'Absent' { 'DarkGray' }
+                default { 'White' }
             }
             Write-Host ("  {0,-12} {1,-22} {2,-20} {3}" -f $entry.KB, $entry.State, $entry.Date, $entry.Package) -ForegroundColor $color
         }
         Write-Host ""
     }
-    catch {
-        Write-Error "ListInstalledUpdates failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SOFTWARE"
-    }
 }
 
 function UninstallWindowsUpdate {
-    param([Parameter(Mandatory=$true)][string]$KBNumber)
+    param([Parameter(Mandatory = $true)][string]$KBNumber)
 
     # Normalise: accept "KB5001234" or just "5001234"
     $KBNumber = $KBNumber.Trim()
@@ -5196,10 +5102,8 @@ not all updates can be cleanly reversed this way.
 "@)) { return }
 
     Write-Host "Attempting offline uninstall of $KBNumber..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
-        $cbsBase  = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages'
+    Invoke-WithHive 'SOFTWARE' {
+        $cbsBase = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages'
         $packages = Get-ChildItem $cbsBase -ErrorAction SilentlyContinue | Where-Object {
             $_.PSChildName -match $KBNumber
         }
@@ -5217,13 +5121,14 @@ not all updates can be cleanly reversed this way.
                 Write-Host "  $($pkg.PSChildName): CurrentState $curState -> 0 (Absent)" -ForegroundColor Yellow
                 Set-ItemProperty-Logged -Path $pkg.PSPath -Name CurrentState -Value 0 -Type DWord -Force
                 $modified++
-            } else {
+            }
+            else {
                 Write-Host "  $($pkg.PSChildName): already Absent" -ForegroundColor DarkGray
             }
         }
 
         # Clear pending state referencing this KB
-        foreach ($pendKey in @('PackagesPending','SessionsPending')) {
+        foreach ($pendKey in @('PackagesPending', 'SessionsPending')) {
             $pendPath = "HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\$pendKey"
             if (-not (Test-Path $pendPath)) { continue }
             Get-ChildItem $pendPath -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match $KBNumber } | ForEach-Object {
@@ -5235,13 +5140,6 @@ not all updates can be cleanly reversed this way.
         Write-Host "$modified package(s) for $KBNumber marked as Absent." -ForegroundColor Green
         Write-Host "Boot the VM to verify. If the update was mid-install, also run -FixPendingUpdates." -ForegroundColor DarkCyan
     }
-    catch {
-        Write-Error "UninstallWindowsUpdate failed: $_"
-        throw
-    }
-    finally {
-        UnmountOffHive -Hive "SOFTWARE"
-    }
 }
 
 function ListStartupPrograms {
@@ -5251,10 +5149,9 @@ function ListStartupPrograms {
     $allEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     # SOFTWARE hive (HKLM Run/RunOnce)
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
+    Invoke-WithHive 'SOFTWARE' {
         $swPaths = @(
-            @{ Key = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run';     Scope = 'HKLM Run' }
+            @{ Key = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run'; Scope = 'HKLM Run' }
             @{ Key = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'; Scope = 'HKLM RunOnce' }
         )
         foreach ($sp in $swPaths) {
@@ -5265,20 +5162,15 @@ function ListStartupPrograms {
             }
         }
     }
-    catch { Write-Warning "SOFTWARE hive read error: $_" }
-    finally { UnmountOffHive -Hive "SOFTWARE" }
 
     # SYSTEM hive: check SetupType/CmdLine (setup-mode startup script)
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $setupType = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Setup' -ErrorAction SilentlyContinue).SetupType
-        $cmdLine   = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Setup' -ErrorAction SilentlyContinue).CmdLine
+        $cmdLine = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Setup' -ErrorAction SilentlyContinue).CmdLine
         if ($setupType -and $setupType -ne 0 -and $cmdLine) {
             $allEntries.Add([PSCustomObject]@{ Scope = 'Setup CmdLine'; Name = "(SetupType=$setupType)"; Command = $cmdLine })
         }
     }
-    catch { Write-Warning "SYSTEM hive read error: $_" }
-    finally { UnmountOffHive -Hive "SYSTEM" }
 
     # Startup folders on disk
     $startupFolders = @(
@@ -5327,11 +5219,7 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
 "@)) { return }
 
     Write-Host "Disabling auto-start programs on offline guest..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-
-    # Clear Run/RunOnce in SOFTWARE hive
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SOFTWARE"
-    try {
+    Invoke-WithHive 'SOFTWARE' {
         $swPaths = @(
             'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run'
             'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
@@ -5347,16 +5235,15 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             $keyLabel = ($regPath -split '\\')[-1]
             if ($cleared -gt 0) {
                 Write-Host "  Cleared $cleared entry(s) from HKLM\...\$keyLabel" -ForegroundColor Green
-            } else {
+            }
+            else {
                 Write-Host "  ${keyLabel}: already empty" -ForegroundColor DarkGray
             }
         }
     }
-    catch { Write-Warning "SOFTWARE hive write error: $_" }
-    finally { UnmountOffHive -Hive "SOFTWARE" }
 
     # Rename startup folder items
-    $disableExts = @('.exe','.bat','.cmd','.lnk','.vbs','.vbe','.js','.wsf','.wsh')
+    $disableExts = @('.exe', '.bat', '.cmd', '.lnk', '.vbs', '.vbe', '.js', '.wsf', '.wsh')
     $startupFolders = @(
         (Join-Path $script:WinDriveLetter 'ProgramData\Microsoft\Windows\Start Menu\Programs\Startup')
     )
@@ -5383,16 +5270,14 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
 
 function DisableFirewall {
     Write-Host "Disabling Windows Firewall for all profiles on offline guest..." -ForegroundColor Yellow
-    $OfflineWindowsPath = Join-Path $script:WinDriveLetter "Windows"
-    MountOffHive -WinPath $OfflineWindowsPath -Hive "SYSTEM"
-    try {
+    Invoke-WithHive 'SYSTEM' {
         $SystemRoot = Get-SystemRootPath
-        $fwBase     = "$SystemRoot\Services\SharedAccess\Parameters\FirewallPolicy"
+        $fwBase = "$SystemRoot\Services\SharedAccess\Parameters\FirewallPolicy"
 
         $profiles = @(
-            @{ Name = 'DomainProfile';   Desc = 'Domain' }
+            @{ Name = 'DomainProfile'; Desc = 'Domain' }
             @{ Name = 'StandardProfile'; Desc = 'Private' }
-            @{ Name = 'PublicProfile';   Desc = 'Public' }
+            @{ Name = 'PublicProfile'; Desc = 'Public' }
         )
 
         foreach ($prof in $profiles) {
@@ -5404,7 +5289,8 @@ function DisableFirewall {
             $current = (Get-ItemProperty $profPath -ErrorAction SilentlyContinue).EnableFirewall
             if ($current -eq 0) {
                 Write-Host "  $($prof.Desc): already disabled" -ForegroundColor DarkGray
-            } else {
+            }
+            else {
                 Set-ItemProperty-Logged -Path $profPath -Name EnableFirewall -Value 0 -Type DWord -Force
                 Write-Host "  $($prof.Desc): DISABLED (was $current)" -ForegroundColor Green
             }
@@ -5414,13 +5300,319 @@ function DisableFirewall {
         Write-Warning "Remember to re-enable the firewall after recovery:"
         Write-Warning "  Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True"
     }
-    catch {
-        Write-Error "DisableFirewall failed: $_"
-        throw
+}
+
+function AnalyzeCriticalBootFiles {
+    Write-Host "Analyzing critical boot/system files on offline guest..." -ForegroundColor Yellow
+    $checks = @(
+        @{ Name = 'bootmgr'; Path = (Join-Path $script:BootDriveLetter 'bootmgr') }
+        @{ Name = 'BCD store'; Path = (Get-BcdStorePath -BootDrive $script:BootDriveLetter -Generation $script:VMGen) }
+        @{ Name = 'winload'; Path = (Join-Path $script:WinDriveLetter $(if ($script:VMGen -eq 2) { 'Windows\System32\winload.efi' } else { 'Windows\System32\winload.exe' })) }
+        @{ Name = 'ntdll.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntdll.dll') }
+        @{ Name = 'kernel32.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\kernel32.dll') }
+        @{ Name = 'hal.dll'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\hal.dll') }
+    )
+    # Gen2 UEFI: add the real firmware boot manager and fallback loader
+    if ($script:VMGen -eq 2) {
+        $checks += @(
+            @{ Name = 'bootmgfw.efi'; Path = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi') }
+            @{ Name = 'bootx64.efi'; Path = (Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi') }
+        )
     }
-    finally {
-        UnmountOffHive -Hive "SYSTEM"
+
+    $rows = foreach ($c in $checks) {
+        $exists = Test-Path -LiteralPath $c.Path
+        $size = if ($exists) { (Get-Item -LiteralPath $c.Path -ErrorAction SilentlyContinue).Length } else { 0 }
+        [PSCustomObject]@{
+            Artifact = $c.Name
+            Exists   = $exists
+            Size     = if ($exists) { "{0:N0}" -f $size } else { '' }
+            Path     = $c.Path
+        }
     }
+
+    $rows | Format-Table -AutoSize
+    $missing = @($rows | Where-Object { -not $_.Exists })
+    if ($missing.Count -gt 0) {
+        Write-Warning "Missing critical artifact(s): $($missing.Artifact -join ', ')."
+    }
+    else {
+        Write-Host "All checked critical boot/system files are present." -ForegroundColor Green
+    }
+}
+
+function Get-SyntheticDriverSpec {
+    @(
+        @{ Name = 'vmbus'; Start = 0; Bin = 'vmbus.sys'; Desc = 'Hyper-V VMBus' }
+        @{ Name = 'storvsc'; Start = 0; Bin = 'storvsc.sys'; Desc = 'Hyper-V StorVSC (synthetic storage)' }
+        @{ Name = 'netvsc'; Start = 3; Bin = 'netvsc.sys'; Desc = 'Hyper-V NetVSC (synthetic network)' }
+    )
+}
+
+function AnalyzeSyntheticDrivers {
+    Write-Host "Analyzing Azure/Hyper-V synthetic driver readiness..." -ForegroundColor Yellow
+    Invoke-WithHive 'SYSTEM' {
+        $sysRoot = Get-SystemRootPath
+        $rows = foreach ($d in (Get-SyntheticDriverSpec)) {
+            $svcPath = "$sysRoot\Services\$($d.Name)"
+            $exists = Test-Path $svcPath
+            $start = if ($exists) { (Get-ItemProperty $svcPath -ErrorAction SilentlyContinue).Start } else { $null }
+            $binPath = Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($d.Bin)"
+            $binExists = Test-Path -LiteralPath $binPath
+            [PSCustomObject]@{
+                Driver       = $d.Name
+                Expected     = $d.Start
+                CurrentStart = if ($null -ne $start) { $start } else { 'MissingKey' }
+                BinaryExists = $binExists
+                Healthy      = ($exists -and $binExists -and [int]$start -eq [int]$d.Start)
+                Notes        = $d.Desc
+            }
+        }
+        $rows | Format-Table -AutoSize
+        $bad = @($rows | Where-Object { -not $_.Healthy })
+        if ($bad.Count -gt 0) {
+            Write-Warning "One or more synthetic drivers are not healthy. Consider -EnsureSyntheticDriversEnabled."
+        }
+        else {
+            Write-Host "Synthetic driver checks look healthy." -ForegroundColor Green
+        }
+    }
+}
+
+function EnsureSyntheticDriversEnabled {
+    if (-not (Confirm-CriticalOperation -Operation 'Enable Azure synthetic drivers (-EnsureSyntheticDriversEnabled)' -Details @"
+Sets Start values for core Hyper-V synthetic drivers when service key and binary are present:
+  vmbus=0, storvsc=0, netvsc=2
+Skips entries if service key or driver binary is missing.
+"@)) { return }
+
+    Invoke-WithHive 'SYSTEM' {
+        $sysRoot = Get-SystemRootPath
+        foreach ($d in (Get-SyntheticDriverSpec)) {
+            $svcPath = "$sysRoot\Services\$($d.Name)"
+            $binPath = Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($d.Bin)"
+            if (-not (Test-Path $svcPath)) {
+                Write-Host "  $($d.Name): service key missing, skipped." -ForegroundColor Yellow
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $binPath)) {
+                Write-Host "  $($d.Name): binary missing ($($d.Bin)), skipped." -ForegroundColor Yellow
+                continue
+            }
+            $cur = (Get-ItemProperty $svcPath -ErrorAction SilentlyContinue).Start
+            if ($null -ne $cur -and [int]$cur -eq [int]$d.Start) {
+                Write-Host "  $($d.Name): already Start=$cur" -ForegroundColor DarkGray
+            }
+            else {
+                Set-ItemProperty-Logged -Path $svcPath -Name Start -Value $d.Start -Type DWord -Force
+                Write-Host "  $($d.Name): Start set to $($d.Start)" -ForegroundColor Green
+            }
+        }
+    }
+}
+
+function ResetInterfacesToDHCP {
+    if (-not (Confirm-CriticalOperation -Operation 'Reset interfaces to DHCP (-ResetInterfacesToDHCP)' -Details @"
+For all offline NIC interface keys under Tcpip\Parameters\Interfaces:
+  - sets EnableDHCP=1
+  - removes static IPv4 and static DNS fields (IPAddress, SubnetMask, DefaultGateway, NameServer)
+Use this for migrated/cloned VMs stuck with stale static networking.
+"@)) { return }
+
+    Invoke-WithHive 'SYSTEM' {
+        $sysRoot = Get-SystemRootPath
+        $ifRoot = "$sysRoot\Services\Tcpip\Parameters\Interfaces"
+        if (-not (Test-Path $ifRoot)) {
+            Write-Warning "Interfaces key not found: $ifRoot"
+            return
+        }
+        $changed = 0
+        $propsToClear = @('IPAddress', 'SubnetMask', 'DefaultGateway', 'DefaultGatewayMetric', 'NameServer')
+        foreach ($if in (Get-ChildItem $ifRoot -ErrorAction SilentlyContinue)) {
+            $ifPath = $if.PSPath
+            Set-ItemProperty-Logged -Path $ifPath -Name EnableDHCP -Value 1 -Type DWord -Force
+            $changed++
+            $pnames = (Get-ItemProperty $ifPath -ErrorAction SilentlyContinue).PSObject.Properties.Name
+            foreach ($pn in $propsToClear) {
+                if ($pnames -contains $pn) {
+                    Remove-ItemProperty-Logged -Path $ifPath -Name $pn
+                }
+            }
+        }
+        Write-Host "Reset DHCP/static settings on $changed interface key(s)." -ForegroundColor Green
+    }
+}
+
+function AnalyzeProxyState {
+    Write-Host "Analyzing machine proxy/PAC state..." -ForegroundColor Yellow
+    Invoke-WithHive 'SOFTWARE' {
+        $paths = @(
+            'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings'
+            'HKLM:\BROKENSOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Internet Settings'
+        )
+        $rows = foreach ($p in $paths) {
+            if (-not (Test-Path $p)) { continue }
+            $r = Get-ItemProperty $p -ErrorAction SilentlyContinue
+            [PSCustomObject]@{
+                Key           = $p
+                ProxyEnable   = $r.ProxyEnable
+                ProxyServer   = $r.ProxyServer
+                AutoConfigURL = $r.AutoConfigURL
+                AutoDetect    = $r.AutoDetect
+            }
+        }
+        if (-not $rows) {
+            Write-Host "No proxy keys found." -ForegroundColor DarkGray
+            return
+        }
+        $rows | Format-Table -AutoSize
+        if (@($rows | Where-Object { $_.ProxyEnable -eq 1 -or $_.ProxyServer -or $_.AutoConfigURL }).Count -gt 0) {
+            Write-Warning "Proxy/PAC settings detected. If remote access is blocked, consider -ClearProxyState."
+        }
+    }
+}
+
+function ClearProxyState {
+    if (-not (Confirm-CriticalOperation -Operation 'Clear machine proxy state (-ClearProxyState)' -Details @"
+Clears ProxyServer/ProxyOverride/AutoConfigURL and sets ProxyEnable=0 in machine Internet Settings.
+Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migration.
+"@)) { return }
+
+    Invoke-WithHive 'SOFTWARE' {
+        $paths = @(
+            'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings'
+            'HKLM:\BROKENSOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Internet Settings'
+        )
+        foreach ($p in $paths) {
+            if (-not (Test-Path $p)) { continue }
+            Set-ItemProperty-Logged -Path $p -Name ProxyEnable -Value 0 -Type DWord -Force
+            $pnames = (Get-ItemProperty $p -ErrorAction SilentlyContinue).PSObject.Properties.Name
+            foreach ($pn in @('ProxyServer', 'ProxyOverride', 'AutoConfigURL')) {
+                if ($pnames -contains $pn) { Remove-ItemProperty-Logged -Path $p -Name $pn }
+            }
+            Write-Host "  Cleared proxy settings in $p" -ForegroundColor Green
+        }
+    }
+}
+
+function AnalyzeBcdConsistency {
+    Write-Host "Analyzing BCD consistency..." -ForegroundColor Yellow
+    $store = Get-BcdStorePath -BootDrive $script:BootDriveLetter -Generation $script:VMGen
+    if (-not (Test-Path -LiteralPath $store)) {
+        Write-Warning "BCD store not found: $store"
+        return
+    }
+    $id = Get-BcdBootLoaderId -StorePath $store
+    if (-not $id) {
+        Write-Warning "Unable to resolve Windows Boot Loader identifier in BCD."
+        return
+    }
+
+    $raw = & cmd.exe /c "bcdedit /store `"$store`" /enum $id" 2>&1
+    $txt = ($raw -join "`n")
+    $device = [regex]::Match($txt, '(?im)^\s*device\s+(.+)$').Groups[1].Value.Trim()
+    $osdev = [regex]::Match($txt, '(?im)^\s*osdevice\s+(.+)$').Groups[1].Value.Trim()
+    $path = [regex]::Match($txt, '(?im)^\s*path\s+(.+)$').Groups[1].Value.Trim()
+    $sysrt = [regex]::Match($txt, '(?im)^\s*systemroot\s+(.+)$').Groups[1].Value.Trim()
+
+    $expectedPath = if ($script:VMGen -eq 2) { '\Windows\System32\winload.efi' } else { '\Windows\System32\winload.exe' }
+    $expectedFile = Join-Path $script:WinDriveLetter ($expectedPath.TrimStart('\'))
+    $pathOk = [string]::Equals($path, $expectedPath, [System.StringComparison]::OrdinalIgnoreCase)
+    $fileOk = Test-Path -LiteralPath $expectedFile
+
+    [PSCustomObject]@{
+        BcdStore       = $store
+        LoaderId       = $id
+        Device         = $device
+        OsDevice       = $osdev
+        Path           = $path
+        SystemRoot     = $sysrt
+        ExpectedPath   = $expectedPath
+        ExpectedExists = $fileOk
+    } | Format-List
+
+    if (-not $pathOk -or -not $fileOk) {
+        Write-Warning "BCD entry may be inconsistent (path mismatch or winload file missing). Consider -FixBoot if boot fails."
+    }
+    else {
+        Write-Host "BCD loader path and winload target look consistent." -ForegroundColor Green
+    }
+}
+
+function AnalyzeServicingState {
+    Write-Host "Analyzing servicing/CBS pending state..." -ForegroundColor Yellow
+    $pendingXml = Join-Path $script:WinDriveLetter 'Windows\WinSxS\pending.xml'
+    $hasPendingXml = Test-Path -LiteralPath $pendingXml
+
+    Invoke-WithHive 'SOFTWARE','COMPONENTS' {
+        $cbs = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
+        $counts = @{}
+        foreach ($k in @('PackagesPending', 'SessionsPending', 'RebootPending')) {
+            $p = Join-Path $cbs $k
+            $counts[$k] = if (Test-Path $p) { (Get-ChildItem $p -ErrorAction SilentlyContinue | Measure-Object).Count } else { 0 }
+        }
+
+        $comp = 'HKLM:\BROKENCOMPONENTS'
+        $cp = Get-ItemProperty $comp -ErrorAction SilentlyContinue
+        [PSCustomObject]@{
+            PendingXmlPresent    = $hasPendingXml
+            PackagesPending      = $counts['PackagesPending']
+            SessionsPending      = $counts['SessionsPending']
+            RebootPending        = $counts['RebootPending']
+            ExecutionState       = $cp.ExecutionState
+            PendingXmlIdentifier = $cp.PendingXmlIdentifier
+            NextQueueEntryIndex  = $cp.NextQueueEntryIndex
+            StoreDirty           = $cp.StoreDirty
+        } | Format-List
+
+        if ($hasPendingXml -or $counts['PackagesPending'] -gt 0 -or $counts['SessionsPending'] -gt 0 -or $counts['RebootPending'] -gt 0) {
+            Write-Warning "Servicing pending markers detected. If boot loops in update stage, consider -FixPendingUpdates."
+        }
+        else {
+            Write-Host "No major pending servicing markers detected." -ForegroundColor Green
+        }
+    }
+}
+
+function AnalyzeDomainTrustState {
+    Write-Host "Analyzing likely domain-join/trust state signals..." -ForegroundColor Yellow
+    Invoke-WithHive 'SYSTEM','SOFTWARE' {
+        $sysRoot = Get-SystemRootPath
+        $tcpip = "$sysRoot\Services\Tcpip\Parameters"
+        $domain = (Get-ItemProperty $tcpip -ErrorAction SilentlyContinue).Domain
+        $dhcpDomain = (Get-ItemProperty $tcpip -ErrorAction SilentlyContinue).DhcpDomain
+        $netlogonStart = (Get-ItemProperty "$sysRoot\Services\Netlogon" -ErrorAction SilentlyContinue).Start
+        $defaultDomain = (Get-ItemProperty 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue).DefaultDomainName
+        $joined = (($domain -and $domain -notmatch '^(WORKGROUP|LOCALDOMAIN)$') -or ($dhcpDomain -and $dhcpDomain -notmatch '^(WORKGROUP|LOCALDOMAIN)$') -or ($defaultDomain -and $defaultDomain -notmatch '^(WORKGROUP|LOCALDOMAIN)$'))
+
+        [PSCustomObject]@{
+            Domain             = $domain
+            DhcpDomain         = $dhcpDomain
+            DefaultDomainName  = $defaultDomain
+            NetlogonStart      = $netlogonStart
+            LikelyDomainJoined = $joined
+            NetlogonDisabled   = ($netlogonStart -eq 4)
+        } | Format-List
+
+        if ($joined -and $netlogonStart -eq 4) {
+            Write-Warning "Domain-join signals found but Netlogon is disabled. This can break domain authentication and RDP."
+        }
+    }
+}
+
+function PrepareRecoveryDiagnostics {
+    if (-not (Confirm-CriticalOperation -Operation 'Prepare Recovery Diagnostics (-PrepareRecoveryDiagnostics)' -Details @"
+Applies a conservative diagnostics bundle for a broken VM:
+  - Enable boot logging (ntbtlog.txt)
+  - Enable serial console (EMS)
+  - Configure full memory dump settings
+No destructive file or registry cleanup is performed.
+"@)) { return }
+
+    SetBootLog
+    EnableSerialConsole
+    ConfigureFullMemDump
+    Write-Host "Recovery diagnostics bundle applied." -ForegroundColor Green
 }
 
 ################################################################################
@@ -5730,8 +5922,8 @@ function Repair-OfflineDisk {
         [switch]$IncludeServices,
         [switch]$IssuesOnly,
         [string[]]$DisableDriverOrService = @(),
-        [string[]]$EnableDriverOrService  = @(),
-        [ValidateSet('Boot','System','Automatic','Manual','Disabled')][string]$DriverStartType = 'Manual',
+        [string[]]$EnableDriverOrService = @(),
+        [ValidateSet('Boot', 'System', 'Automatic', 'Manual', 'Disabled')][string]$DriverStartType = 'Manual',
         [switch]$DisableCredentialGuard,
         [switch]$EnableCredentialGuard,
         [switch]$DisableAppLocker,
@@ -5750,6 +5942,16 @@ function Repair-OfflineDisk {
         [switch]$CheckDiskHealth,
         [switch]$CollectEventLogs,
         [switch]$CollectMinidumps,
+        [switch]$AnalyzeCriticalBootFiles,
+        [switch]$AnalyzeSyntheticDrivers,
+        [switch]$EnsureSyntheticDriversEnabled,
+        [switch]$ResetInterfacesToDHCP,
+        [switch]$AnalyzeProxyState,
+        [switch]$ClearProxyState,
+        [switch]$AnalyzeBcdConsistency,
+        [switch]$AnalyzeServicingState,
+        [switch]$AnalyzeDomainTrustState,
+        [switch]$PrepareRecoveryDiagnostics,
         [switch]$DisableDriverVerifier,
         [string]$EnableDriverVerifier = '',
         [switch]$ResetGroupPolicy,
@@ -5762,8 +5964,8 @@ function Repair-OfflineDisk {
         [switch]$DisableStartupPrograms,
         [switch]$DisableFirewall,
         [switch]$LeaveDiskOnline,
-        [ValidateSet('SYSTEM','SOFTWARE','COMPONENTS','SAM','SECURITY')][string[]]$LoadHive  = @(),
-        [ValidateSet('SYSTEM','SOFTWARE','COMPONENTS','SAM','SECURITY')][string[]]$UnloadHive = @(),
+        [ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$LoadHive = @(),
+        [ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY')][string[]]$UnloadHive = @(),
         [string]$DriveLetter = ''
     )
 
@@ -5794,24 +5996,17 @@ PARAMETERS:
   -FixAzureGuestAgent    Enable Azure Guest Agent and RdAgent services (registry already present)
   -InstallAzureVMAgent   Install Azure VM Agent fully offline from host files (use when agent is missing)
 
---- BOOT & BCD ----------------------------------------------------------------
-  -DisableStartupRepair  Stop VM from looping into WinRE on failed boot
-  -EnableBootLog         Enable ntbtlog.txt boot logging
-  -EnableStartupRepair   Re-enable automatic startup repair / WinRE on boot failure
-  -EnableTestSigning     Enable BCD test signing (allow unsigned drivers)
-  -DisableTestSigning    Disable BCD test signing
-  -FixBoot               Rebuild BCD from scratch
-  -FixBootSector         Repair MBR/VBR boot sector (Gen1/BIOS only; bootrec)
-  -RemoveSafeModeFlag    Remove Safe Mode flag
-  -TryLGKC               Switch boot to Last Known Good Control Set
-  -TryOtherBootConfig    Switch boot to a different HKLM ControlSet
-  -TrySafeMode           Set boot to Safe Mode (minimal)
-
 --- DIAGNOSTICS (read-only) ---------------------------------------------------
   -CheckDiskHealth       Show disk/partition/filesystem health report
   -CheckRDPPolicies      Show current RDP auth policy values
   -CollectEventLogs      Copy guest event logs and crash dumps to C:\temp on the host
   -CollectMinidumps      Copy minidumps, MEMORY.DMP and LiveKernelReports to C:\temp on the host
+  -AnalyzeCriticalBootFiles  Validate presence of critical boot/system binaries used during startup
+  -AnalyzeSyntheticDrivers  Validate Azure/Hyper-V synthetic drivers (vmbus/storvsc/netvsc)
+  -AnalyzeProxyState     Show machine proxy/PAC settings that may block remote management
+  -AnalyzeBcdConsistency Validate BCD loader/device/path consistency for current boot mode
+  -AnalyzeServicingState Check pending CBS/servicing markers (pending.xml, SessionsPending, RebootPending)
+  -AnalyzeDomainTrustState  Assess likely domain-join/trust indicators from offline registry
   -ListInstalledUpdates  List installed Windows Updates (KB numbers) from offline CBS packages
   -ListStartupPrograms   List all auto-start programs (Run/RunOnce/Startup folders/Setup CmdLine)
   -ScanNetBindings       Report third-party network binding components (non-ms_ ComponentId)
@@ -5843,6 +6038,7 @@ PARAMETERS:
   -DisableDriverOrService <name[,name,...]>  Disable one or more named services or drivers (sets Start=4)
   -DisableDriverVerifier   Disable Driver Verifier (clears VerifyDrivers/VerifyDriverLevel)
   -EnableDriverVerifier [driver1.sys,...]  Enable Driver Verifier with standard flags; omit value to verify all drivers
+  -EnsureSyntheticDriversEnabled  Re-enable core Azure synthetic drivers (vmbus/storvsc/netvsc)
   -EnableDriverOrService  <name[,name,...]>  Re-enable one or more named services or drivers
   -DriverStartType <type>           Start type for -EnableDriverOrService: Boot, System, Automatic, Manual (default), Disabled
   -DisableThirdPartyDrivers    Disable all non-Microsoft Boot/System kernel drivers
@@ -5864,6 +6060,8 @@ PARAMETERS:
   -EnableBFE             Re-enable Base Filtering Engine service
   -FixNetBindings        Remove orphaned third-party network binding components (missing binary; prevents NDIS init failure)
   -ResetNetworkStack     Reset TCP/IP stack, Winsock, firewall and DNS at next boot (also clears static DNS offline)
+  -ResetInterfacesToDHCP Reset interface IPv4 settings to DHCP and clear static DNS/gateway values
+  -ClearProxyState       Clear machine-level proxy/PAC settings in offline SOFTWARE hive
 
 --- RDP & REMOTE ACCESS -------------------------------------------------------
   -DisableNLA            Disable Network Level Authentication
@@ -5899,6 +6097,7 @@ PARAMETERS:
   -DisableWindowsUpdate  Disable Windows Update services to stop boot loops
   -FixPendingUpdates     Remove pending Windows Update transactions
   -UninstallWindowsUpdate <KB>  Mark a KB update as Absent in CBS (offline best-effort uninstall)
+  -PrepareRecoveryDiagnostics  Bundle for broken VMs: boot log + serial console + full memory dump config
 
 AVAILABLE DISKS:
 "@
@@ -5964,8 +6163,8 @@ AVAILABLE DISKS:
 
     # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
     # Determine if any write/repair action was requested (exclude pure read-only switches)
-    $readOnlySwitches = @('SysCheck','CheckDiskHealth','ScanNetBindings','CheckRDPPolicies','CollectEventLogs','CollectMinidumps','ShowLastSession','GetServicesReport','ListInstalledUpdates','ListStartupPrograms')
-    $hasRepairAction  = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName','DiskNumber','LeaveDiskOnline','DriveLetter','LoadHive','UnloadHive') }
+    $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'AnalyzeBcdConsistency', 'AnalyzeServicingState', 'AnalyzeDomainTrustState')
+    $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'LeaveDiskOnline', 'DriveLetter', 'LoadHive', 'UnloadHive') }
     if ($hasRepairAction) {
         Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
         Write-Host ""
@@ -5977,13 +6176,12 @@ AVAILABLE DISKS:
     # Resolve guest computer name from the offline SYSTEM hive (for log entries)
     $script:GuestComputerName = ''
     try {
-        $OffWinPath = Join-Path $script:WinDriveLetter "Windows"
-        MountOffHive -WinPath $OffWinPath -Hive "SYSTEM"
-        try {
+        Invoke-WithHive 'SYSTEM' {
             $sysRoot = Get-SystemRootPath
             $script:GuestComputerName = (Get-ItemProperty "$sysRoot\Control\ComputerName\ComputerName" -ErrorAction SilentlyContinue).ComputerName
-        } finally { UnmountOffHive -Hive "SYSTEM" }
-    } catch { $script:GuestComputerName = '' }
+        }
+    }
+    catch { $script:GuestComputerName = '' }
     if ($script:GuestComputerName) {
         Write-Host "[OK] Guest name   : $($script:GuestComputerName)" -ForegroundColor Green
         Write-Host ""
@@ -6020,8 +6218,8 @@ AVAILABLE DISKS:
         if ($FixRDP) { ResetRDPSettings }
         if ($FixRDPCert) { RecreateRDPCertificate }
         if ($FixRDPPermissions) { ResetRDPPrivKeyPermissions }
-        if ($DisableNLA) { SetNLADisabled }
-        if ($EnableNLA) { SetNLAEnabled }
+        if ($DisableNLA) { SetNLA -Enable $false }
+        if ($EnableNLA) { SetNLA -Enable $true }
         if ($EnableWinRMHTTPS) { SetWinRMHTTPSEnabled }
         if ($FixPendingUpdates) { ClearPendingUpdates }
         if ($DisableWindowsUpdate) { DisableWindowsUpdate }
@@ -6039,7 +6237,7 @@ AVAILABLE DISKS:
         if ($GetServicesReport) { GetServicesReport -IncludeServices:$IncludeServices -IssuesOnly:$IssuesOnly }
         foreach ($d in $DisableDriverOrService) { if (-not [string]::IsNullOrWhiteSpace($d)) { Disable-ServiceOrDriver -ServiceName $d.Trim() } }
         if ($EnableDriverOrService.Count -gt 0) {
-            $startMap = @{ Boot=0; System=1; Automatic=2; Manual=3; Disabled=4 }
+            $startMap = @{ Boot = 0; System = 1; Automatic = 2; Manual = 3; Disabled = 4 }
             $startInt = $startMap[$DriverStartType]
             foreach ($d in $EnableDriverOrService) { if (-not [string]::IsNullOrWhiteSpace($d)) { Enable-ServiceOrDriver -ServiceName $d.Trim() -StartValue $startInt } }
         }
@@ -6062,6 +6260,16 @@ AVAILABLE DISKS:
         if ($DisableTestSigning) { SetTestSigning -Enable $false }
         if ($CheckDiskHealth) { CheckDiskHealth }
         if ($CollectEventLogs) { CollectEventLogs }
+        if ($AnalyzeCriticalBootFiles) { AnalyzeCriticalBootFiles }
+        if ($AnalyzeSyntheticDrivers) { AnalyzeSyntheticDrivers }
+        if ($EnsureSyntheticDriversEnabled) { EnsureSyntheticDriversEnabled }
+        if ($ResetInterfacesToDHCP) { ResetInterfacesToDHCP }
+        if ($AnalyzeProxyState) { AnalyzeProxyState }
+        if ($ClearProxyState) { ClearProxyState }
+        if ($AnalyzeBcdConsistency) { AnalyzeBcdConsistency }
+        if ($AnalyzeServicingState) { AnalyzeServicingState }
+        if ($AnalyzeDomainTrustState) { AnalyzeDomainTrustState }
+        if ($PrepareRecoveryDiagnostics) { PrepareRecoveryDiagnostics }
         if ($CheckRDPPolicies) { GetRdpAuthPolicySnapshot }
         if ($FixRDPAuth) { SetRdpAuthPolicyOptimal }
         if ($DisableDriverVerifier) { DisableDriverVerifier }
