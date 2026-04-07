@@ -15,7 +15,7 @@
     .SYNOPSIS
         Offline Azure VM disk repair and diagnostic script for use on a Hyper-V rescue VM.
         Author: Marcus Ferreira marcus.ferreira[at]microsoft[dot]com
-        Version: 0.3.5
+        Version: 0.3.9
 
     .DESCRIPTION
         Repair-AzVMDisk.ps1 attaches the OS disk of a broken Azure VM to a Hyper-V rescue VM and performs
@@ -115,6 +115,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableCredentialGuard,
     [Parameter(ParameterSetName = 'Repair')][switch]$EnableCredentialGuard,
     [Parameter(ParameterSetName = 'Repair')][switch]$DisableAppLocker,
+    [Parameter(ParameterSetName = 'Repair')][switch]$GetAppLockerReport,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixSanPolicy,
     [Parameter(ParameterSetName = 'Repair')][switch]$FixAzureGuestAgent,
     [Parameter(ParameterSetName = 'Repair')][switch]$InstallAzureVMAgent,
@@ -137,6 +138,7 @@ param (
     [Parameter(ParameterSetName = 'Repair')][switch]$ResetInterfacesToDHCP,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeProxyState,
     [Parameter(ParameterSetName = 'Repair')][switch]$ClearProxyState,
+    [Parameter(ParameterSetName = 'Repair')][switch]$GetBootPathReport,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeBcdConsistency,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeServicingState,
     [Parameter(ParameterSetName = 'Repair')][switch]$AnalyzeDomainTrustState,
@@ -844,6 +846,19 @@ $($htmlRows -join "`n")
         $wp = Join-Path $script:WinDriveLetter "Windows"
         foreach ($h in $Hive) { MountOffHive -WinPath $wp -Hive $h }
         try {
+            # Opportunistically capture the guest computer name the first time
+            # the SYSTEM hive is loaded for any reason (avoids a dedicated load).
+            if ($Hive -contains 'SYSTEM' -and -not $script:GuestComputerName) {
+                try {
+                    $sysRoot = Get-SystemRootPath
+                    $script:GuestComputerName = (Get-ItemProperty "$sysRoot\Control\ComputerName\ComputerName" -ErrorAction SilentlyContinue).ComputerName
+                    if ($script:GuestComputerName) {
+                        Write-Host "[OK] Guest name   : $($script:GuestComputerName)" -ForegroundColor Green
+                        Write-Host ""
+                    }
+                }
+                catch { <# non-critical #> }
+            }
             & $ScriptBlock
         }
         finally {
@@ -904,7 +919,7 @@ $($htmlRows -join "`n")
 
         if ($sig.Status -eq 'Valid') {
             $result.IsSigned = $true
-            # Match on Microsoft certificate subject — covers:
+            # Match on Microsoft certificate subject  -  covers:
             #   CN=Microsoft Windows, O=Microsoft Corporation
             #   CN=Microsoft Corporation, O=Microsoft Corporation
             #   CN=Microsoft Windows Publisher, O=Microsoft Corporation
@@ -928,7 +943,7 @@ $($htmlRows -join "`n")
             }
             elseif ($sig.Status -in @('UnknownError', 'NotSupportedFileFormat')) {
                 # File format not parseable by Authenticode (compressed boot stub, etc.)
-                # and no VersionInfo available — mark as inconclusive rather than suspect.
+                # and no VersionInfo available  -  mark as inconclusive rather than suspect.
                 $result.Status = 'NotVerifiable'
                 $result.IsSigned = $true
                 $result.IsMicrosoft = $true
@@ -2437,7 +2452,22 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 # Kernel-mode start types: 0=Boot, 1=System, 2=Auto, 3=Manual, 4=Disabled
                 # Target Boot(0) and System(1) drivers that are third-party
 
+                # Azure-safe vendors: drivers from these companies may be required on Azure
+                # VMs (accelerated networking, GPU, NVMe, storage). Do NOT disable them.
+                $azureSafeVendors = @(
+                    'Mellanox',                  # Accelerated networking (MANA/mlx5/ConnectX)
+                    'NVIDIA',                    # GPU compute (NCv3, NDv2, etc.)
+                    'Intel',                     # LPSS GPIO/I2C, iaStorAV, NVMe
+                    'Advanced Micro Devices',    # CPU microcode, storage
+                    'AMD',                       # CPU microcode, storage (short name variant)
+                    'Chelsio',                   # iWARP RDMA (HPC SKUs)
+                    'Marvell',                   # NVMe controllers on some hardware
+                    'Broadcom'                   # Network/storage (Emulex rebranded)
+                )
+                $azureSafePattern = ($azureSafeVendors | ForEach-Object { [regex]::Escape($_) }) -join '|'
+
                 $disabled = @()
+                $skippedAzure = @()
                 Get-ChildItem $ServicesRoot -ErrorAction SilentlyContinue | ForEach-Object {
                     $svcPath = $_.PSPath
                     $props = Get-ItemProperty -Path $svcPath -ErrorAction SilentlyContinue
@@ -2456,13 +2486,22 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     # If the binary is missing, treat the driver as third-party - a missing
                     # Boot/System binary will cause a BSOD on next boot regardless of vendor.
                     $isMicrosoft = $false
+                    $isAzureSafe = $false
                     $binaryMissing = $false
+                    $vendorName = ''
                     if (Test-Path $imagePath) {
                         $vi = (Get-Item $imagePath -ErrorAction SilentlyContinue).VersionInfo
-                        if ($vi -and $vi.CompanyName -match 'Microsoft') { $isMicrosoft = $true }
+                        $vendorName = if ($vi -and $vi.CompanyName) { $vi.CompanyName.Trim() } else { '' }
+                        if ($vendorName -match 'Microsoft') { $isMicrosoft = $true }
+                        elseif ($vendorName -and $vendorName -match $azureSafePattern) { $isAzureSafe = $true }
                     }
                     else {
                         $binaryMissing = $true   # missing binary -> will BSOD -> must disable
+                    }
+
+                    if ($isAzureSafe -and -not $binaryMissing) {
+                        $skippedAzure += [PSCustomObject]@{ Service = $_.PSChildName; Vendor = $vendorName }
+                        return
                     }
 
                     if (-not $isMicrosoft) {
@@ -2485,6 +2524,14 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                         Write-Host "Set-ItemProperty -Path '$livePath' -Name Start -Value $($d.PreviousStart) -Type DWord -Force" -ForegroundColor White
                     }
                     Write-Host "----------------------------------------------------`n" -ForegroundColor Cyan
+                }
+
+                if ($skippedAzure.Count -gt 0) {
+                    Write-Host "  Azure-safe drivers kept enabled (may be needed for accelerated networking/GPU/NVMe):" -ForegroundColor DarkCyan
+                    foreach ($s in $skippedAzure) {
+                        Write-Host "    $($s.Service)  ($($s.Vendor))" -ForegroundColor DarkCyan
+                    }
+                    Write-Host ""
                 }
             }
         }
@@ -2640,19 +2687,28 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 $missing = @($rows | Where-Object { $_.BinaryPresent -eq $false }).Count
                 $nonMS = @($rows | Where-Object { $_.BinaryPresent -eq $true -and $_.Vendor -notmatch 'Microsoft' }).Count
                 $boot_sys = @($rows | Where-Object { $_.StartVal -in @(0, 1) }).Count
-                $sevCrit = @($rows | Where-Object { $null -ne $_.ErrorControl -and $_.ErrorControl -ge 2 }).Count
+                # ErrorControl Severe/Critical only matters for kernel drivers (Type 1/2/4/8);
+                # Win32 services (Type 16/32/256) do not BSOD on failure regardless of ErrorControl.
+                $isKernelDriver = @(1, 2, 4, 8)
+                $sevCritDrivers = @($rows | Where-Object { $_.TypeVal -in $isKernelDriver -and $null -ne $_.ErrorControl -and $_.ErrorControl -ge 2 }).Count
+                $missingBootSys = @($rows | Where-Object { $_.BinaryPresent -eq $false -and $_.StartVal -in @(0, 1) -and $_.TypeVal -in $isKernelDriver }).Count
 
                 Write-Host "`n  ===========================================================" -ForegroundColor Cyan
-                Write-Host ("  Total {0}: {1}  |  Boot/System: {2}  |  Missing binary: {3}  |  Non-Microsoft: {4}  |  Severe/Critical EC: {5}" `
-                        -f $reportLabel, $total, $boot_sys, $missing, $nonMS, $sevCrit) -ForegroundColor Cyan
-                if ($missing -gt 0) {
-                    Write-Host "  [!] Missing-binary Boot/System drivers will cause a BSOD - run -DisableThirdPartyDrivers to neutralise them." -ForegroundColor Red
+                Write-Host ("  Total {0}: {1}  |  Boot/System: {2}  |  Missing binary: {3}  |  Non-Microsoft: {4}  |  Severe/Critical EC (drivers): {5}" `
+                        -f $reportLabel, $total, $boot_sys, $missing, $nonMS, $sevCritDrivers) -ForegroundColor Cyan
+                if ($missingBootSys -gt 0) {
+                    Write-Host "  [!] $missingBootSys missing-binary Boot/System kernel driver(s) detected - may cause BSOD (e.g. INACCESSIBLE_BOOT_DEVICE)." -ForegroundColor Red
+                    Write-Host "      Run -RepairBrokenSystemFile <driver.sys> to restore from WinSxS, or -DisableThirdPartyDrivers if the driver is non-Microsoft." -ForegroundColor Red
+                }
+                if ($missing -gt 0 -and $missing -ne $missingBootSys) {
+                    $missingSvc = $missing - $missingBootSys
+                    Write-Host "  [i] $missingSvc service(s)/non-boot driver(s) have missing binaries - the service will fail to start but will not BSOD." -ForegroundColor Yellow
                 }
                 if ($nonMS -gt 0) {
                     Write-Host "  [!] Non-Microsoft drivers present - verify each is expected for this guest OS." -ForegroundColor Yellow
                 }
-                if ($sevCrit -gt 0) {
-                    Write-Host "  [!] $sevCrit driver(s) with ErrorControl Sev!(2) or CRIT(3) - failure of these at boot will trigger LKGC fallback or halt the system." -ForegroundColor Yellow
+                if ($sevCritDrivers -gt 0) {
+                    Write-Host "  [!] $sevCritDrivers kernel driver(s) with ErrorControl Sev!(2) or CRIT(3) - failure at boot will trigger LKGC fallback or halt." -ForegroundColor Yellow
                 }
                 Write-Host "  ===========================================================`n" -ForegroundColor Cyan
             }
@@ -2992,6 +3048,168 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
             Write-Warning ("If AppLocker policy is delivered by Intune/MDM, the offline registry path will be empty " +
                 "and policy will reapply on next MDM sync. Resolve via Intune before starting the VM.")
         }
+    }
+
+    function GetAppLockerReport {
+        # Reads AppLocker configuration from the offline SOFTWARE and SYSTEM hives and
+        # produces a human-readable report:
+        #   - Per-collection enforcement mode
+        #   - AppIDSvc service start type
+        #   - Parsed rule details (Name, Action, Type, Conditions)
+        Write-Host "`n========== AppLocker Report ==========" -ForegroundColor Cyan
+
+        Invoke-WithHive 'SYSTEM', 'SOFTWARE' {
+            & {
+                # --- AppIDSvc from SYSTEM hive ---
+                $sel = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue
+                $curSet = $sel.Current
+                $csName = if ($curSet) { 'ControlSet{0:d3}' -f $curSet } else { 'ControlSet001' }
+                $svcRoot = "HKLM:\BROKENSYSTEM\$csName\Services"
+
+                $appIdPath = "$svcRoot\AppIDSvc"
+                $appIdStart = if (Test-Path $appIdPath) { (Get-ItemProperty $appIdPath -ErrorAction SilentlyContinue).Start } else { $null }
+                $startLabels = @{ 0 = 'Boot'; 1 = 'System'; 2 = 'Automatic'; 3 = 'Manual'; 4 = 'Disabled' }
+                $startLabel = if ($null -ne $appIdStart -and $startLabels.ContainsKey([int]$appIdStart)) { $startLabels[[int]$appIdStart] } else { "Unknown($appIdStart)" }
+
+                Write-Host "`n--- Application Identity Service (AppIDSvc) ---" -ForegroundColor Yellow
+                if ($null -eq $appIdStart) {
+                    Write-Host "  AppIDSvc registry key not found - service not installed." -ForegroundColor DarkGray
+                }
+                elseif ($appIdStart -eq 2) {
+                    Write-Host "  Start = $appIdStart ($startLabel)" -ForegroundColor Red
+                    Write-Host "  AppIDSvc is set to AUTO - AppLocker WILL enforce rules at boot." -ForegroundColor Red
+                }
+                elseif ($appIdStart -eq 3) {
+                    Write-Host "  Start = $appIdStart ($startLabel)" -ForegroundColor Yellow
+                    Write-Host "  AppIDSvc is Manual - may be trigger-started if AppLocker policy exists." -ForegroundColor Yellow
+                }
+                elseif ($appIdStart -eq 4) {
+                    Write-Host "  Start = $appIdStart ($startLabel)" -ForegroundColor Green
+                    Write-Host "  AppIDSvc is Disabled - AppLocker rules will NOT be enforced at runtime." -ForegroundColor Green
+                }
+                else {
+                    Write-Host "  Start = $appIdStart ($startLabel)" -ForegroundColor Yellow
+                }
+
+                # --- AppLocker policy from SOFTWARE hive ---
+                $srpPaths = @(
+                    @{ Label = 'GPO/MDM Policy'; Path = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\SrpV2' },
+                    @{ Label = 'Local Policy';   Path = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\AppV\SrpV2' }
+                )
+                $modeLabels = @{ 0 = 'Not Configured'; 1 = 'Enforce'; 2 = 'Audit Only' }
+                $collections = @('Exe', 'Dll', 'Script', 'Msi', 'Appx')
+
+                $anyFound = $false
+                foreach ($srp in $srpPaths) {
+                    if (-not (Test-Path $srp.Path)) { continue }
+
+                    Write-Host "`n--- $($srp.Label): $($srp.Path -replace '^HKLM:\\BROKENSOFTWARE\\', 'SOFTWARE\') ---" -ForegroundColor Yellow
+
+                    foreach ($col in $collections) {
+                        $colPath = "$($srp.Path)\$col"
+                        if (-not (Test-Path $colPath)) { continue }
+
+                        $mode = (Get-ItemProperty $colPath -ErrorAction SilentlyContinue).EnforcementMode
+                        $modeLabel = if ($null -ne $mode -and $modeLabels.ContainsKey([int]$mode)) { $modeLabels[[int]$mode] } else { "Unknown($mode)" }
+
+                        $modeColor = switch ([int]$mode) { 1 { 'Red' } 2 { 'Yellow' } default { 'Green' } }
+                        Write-Host "`n  [$col] EnforcementMode = $mode ($modeLabel)" -ForegroundColor $modeColor
+
+                        # Enumerate GUID rule subkeys
+                        $ruleKeys = @(Get-ChildItem $colPath -ErrorAction SilentlyContinue |
+                            Where-Object { $_.PSChildName -match '^\{[0-9a-f-]{36}\}$' })
+
+                        if ($ruleKeys.Count -eq 0) {
+                            Write-Host "    No rules found." -ForegroundColor DarkGray
+                            continue
+                        }
+
+                        $anyFound = $true
+                        Write-Host "    Rules ($($ruleKeys.Count)):" -ForegroundColor White
+
+                        foreach ($rk in $ruleKeys) {
+                            $ruleId = $rk.PSChildName
+                            $valueData = (Get-ItemProperty $rk.PSPath -ErrorAction SilentlyContinue).Value
+                            if (-not $valueData) {
+                                Write-Host "      $ruleId - (no Value data)" -ForegroundColor DarkGray
+                                continue
+                            }
+
+                            # Parse the XML rule
+                            try {
+                                [xml]$ruleXml = $valueData
+                                $ruleNode = $ruleXml.DocumentElement
+                                $ruleName   = $ruleNode.Name
+                                $ruleAction = $ruleNode.Action
+                                $ruleDesc   = $ruleNode.Description
+                                $ruleType   = $ruleNode.LocalName   # e.g. FilePublisherRule, FileHashRule, FilePathRule
+                                $ruleSid    = $ruleNode.UserOrGroupSid
+
+                                # Determine action colour
+                                $actionColor = if ($ruleAction -eq 'Deny') { 'Red' } elseif ($ruleAction -eq 'Allow') { 'Green' } else { 'Yellow' }
+
+                                Write-Host "      $ruleId" -ForegroundColor DarkGray
+                                Write-Host "        Name   : $ruleName" -ForegroundColor White
+                                Write-Host "        Type   : $ruleType" -ForegroundColor White
+                                Write-Host "        Action : " -NoNewline; Write-Host $ruleAction -ForegroundColor $actionColor
+                                if ($ruleDesc) { Write-Host "        Desc   : $ruleDesc" -ForegroundColor White }
+                                Write-Host "        SID    : $ruleSid" -ForegroundColor DarkGray
+
+                                # Extract condition details based on rule type
+                                $conditions = $ruleNode.Conditions
+                                if ($conditions) {
+                                    foreach ($child in $conditions.ChildNodes) {
+                                        switch ($child.LocalName) {
+                                            'FilePublisherCondition' {
+                                                Write-Host "        Publisher  : $($child.PublisherName)" -ForegroundColor Cyan
+                                                Write-Host "        Product   : $($child.ProductName)" -ForegroundColor Cyan
+                                                Write-Host "        Binary    : $($child.BinaryName)" -ForegroundColor Cyan
+                                                $vr = $child.BinaryVersionRange
+                                                if ($vr) { Write-Host "        Version   : $($vr.LowSection) - $($vr.HighSection)" -ForegroundColor DarkGray }
+                                            }
+                                            'FileHashCondition' {
+                                                foreach ($fh in $child.ChildNodes) {
+                                                    if ($fh.LocalName -eq 'FileHash') {
+                                                        Write-Host "        Hash Type : $($fh.Type)" -ForegroundColor Cyan
+                                                        Write-Host "        Hash      : $($fh.Data)" -ForegroundColor Cyan
+                                                        Write-Host "        Source    : $($fh.SourceFileName) ($($fh.SourceFileLength) bytes)" -ForegroundColor DarkGray
+                                                    }
+                                                }
+                                            }
+                                            'FilePathCondition' {
+                                                Write-Host "        Path      : $($child.Path)" -ForegroundColor Cyan
+                                            }
+                                        }
+                                    }
+                                }
+
+                                # Exceptions
+                                $exceptions = $ruleNode.Exceptions
+                                if ($exceptions -and $exceptions.HasChildNodes) {
+                                    Write-Host "        Exceptions:" -ForegroundColor Yellow
+                                    foreach ($exc in $exceptions.ChildNodes) {
+                                        switch ($exc.LocalName) {
+                                            'FilePublisherCondition' { Write-Host "          Publisher: $($exc.PublisherName) / $($exc.ProductName) / $($exc.BinaryName)" -ForegroundColor Yellow }
+                                            'FileHashCondition'      { foreach ($fh in $exc.ChildNodes) { if ($fh.LocalName -eq 'FileHash') { Write-Host "          Hash: $($fh.SourceFileName) ($($fh.Type))" -ForegroundColor Yellow } } }
+                                            'FilePathCondition'      { Write-Host "          Path: $($exc.Path)" -ForegroundColor Yellow }
+                                        }
+                                    }
+                                }
+                            }
+                            catch {
+                                Write-Host "      $ruleId - failed to parse XML: $_" -ForegroundColor Red
+                            }
+                        }
+                    }
+                }
+
+                if (-not $anyFound) {
+                    Write-Host "`n  No AppLocker rule subkeys found in any collection." -ForegroundColor Green
+                }
+            }
+        }
+
+        Write-Host "`n========================================`n" -ForegroundColor Cyan
     }
 
     function FixSanPolicy {
@@ -4030,7 +4248,9 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         # Security
         $sevCredentialGuard = 1   # Credential Guard is enabled
         $sevLsaPPL = 0   # LSA RunAsPPL=1 active
-        $sevAppLockerEnforcing = 1   # AppLocker is enforcing rules
+        $sevAppLockerConfigured = 0  # AppLocker EnforcementMode != 0 only (no service, no rules)
+        $sevAppLockerEnforcing = 1   # AppLocker EnforcementMode != 0 + AppIDSvc auto-start
+        $sevAppLockerActive   = 2   # AppLocker EnforcementMode != 0 + AppIDSvc auto-start + rules exist
         $sevAppIdSvc = 0   # AppIDSvc (Application Identity) is running
 
         # Azure Guest Agent
@@ -4396,7 +4616,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 $bootFileIssues++
             }
             else {
-                # Binary exists and is non-zero — verify Microsoft signature
+                # Binary exists and is non-zero  -  verify Microsoft signature
                 $sigCheck = Test-MicrosoftSignature -FilePath $bf.Path
                 if (-not $sigCheck.IsMicrosoft) {
                     & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($bf.Name) is NOT Microsoft-signed (status=$($sigCheck.Status), subject='$($sigCheck.Subject)') - possible tampering or corruption" $bf.Fix
@@ -4542,7 +4762,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                         $synBad++
                     }
                     else {
-                        # Binary exists, non-zero, start value correct — verify signature
+                        # Binary exists, non-zero, start value correct  -  verify signature
                         $sdSig = Test-MicrosoftSignature -FilePath $sdBinPath
                         if (-not $sdSig.IsMicrosoft) {
                             & $emit 'Security' (& $toSev $sevBinarySignatureBad) "$($sd.Bin) is NOT Microsoft-signed (status=$($sdSig.Status), subject='$($sdSig.Subject)') - possible tampering" "-RepairSystemFile $($sd.Bin)"
@@ -4904,6 +5124,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
 
                 # AppIDSvc (AppLocker enforcement service)
                 $appIdSvc = (Get-ItemProperty "$svcRoot\AppIDSvc" -ErrorAction SilentlyContinue).Start
+                $script:_sysCheckAppIdSvcStart = $appIdSvc
                 if ($null -ne $appIdSvc -and $appIdSvc -ne 4) {
                     & $emit 'Security' (& $toSev $sevAppIdSvc) "AppIDSvc (Application Identity) Start=$appIdSvc - this service is required for AppLocker to enforce rules"
                 }
@@ -5202,12 +5423,33 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
 
                 # AppLocker enforced collections
                 $srpBase = 'HKLM:\BROKENSOFTWARE\Policies\Microsoft\Windows\SrpV2'
-                $enforced = @(foreach ($col in @('Exe', 'Dll', 'Script', 'Msi', 'Appx')) {
-                        $colPath = "$srpBase\$col"
-                        if ((Test-Path $colPath) -and (Get-ItemProperty $colPath -ErrorAction SilentlyContinue).EnforcementMode -ne 0) { $col }
-                    })
-                if ($enforced.Count -gt 0) {
-                    & $emit 'Security' (& $toSev $sevAppLockerEnforcing) "AppLocker is enforcing rules for: $($enforced -join ', ') - may block processes from starting" "-DisableAppLocker"
+                $enforcedCols   = @()  # collections with EnforcementMode != 0
+                $colsWithRules  = @()  # subset that also contain GUID rule subkeys
+                foreach ($col in @('Exe', 'Dll', 'Script', 'Msi', 'Appx')) {
+                    $colPath = "$srpBase\$col"
+                    if (-not (Test-Path $colPath)) { continue }
+                    $mode = (Get-ItemProperty $colPath -ErrorAction SilentlyContinue).EnforcementMode
+                    if ($null -eq $mode -or $mode -eq 0) { continue }
+                    $enforcedCols += $col
+                    # Check for GUID subkeys (each AppLocker rule is stored as a GUID-named subkey)
+                    $ruleKeys = @(Get-ChildItem $colPath -ErrorAction SilentlyContinue |
+                        Where-Object { $_.PSChildName -match '^\{[0-9a-f-]{36}\}$' })
+                    if ($ruleKeys.Count -gt 0) { $colsWithRules += $col }
+                }
+                $appIdAutoStart = ($script:_sysCheckAppIdSvcStart -eq 2)
+                if ($enforcedCols.Count -gt 0) {
+                    if ($appIdAutoStart -and $colsWithRules.Count -gt 0) {
+                        # CRIT: enforcement configured + service will auto-start + rules exist
+                        & $emit 'Security' (& $toSev $sevAppLockerActive) "AppLocker ACTIVE for: $($colsWithRules -join ', ') - EnforcementMode on, AppIDSvc=Auto, rules present - will block processes" "-DisableAppLocker"
+                    }
+                    elseif ($appIdAutoStart) {
+                        # WARN: enforcement configured + service will auto-start (but no rule subkeys found)
+                        & $emit 'Security' (& $toSev $sevAppLockerEnforcing) "AppLocker enforcement configured for: $($enforcedCols -join ', ') with AppIDSvc=Auto, but no rule subkeys found - may still enforce default-deny" "-DisableAppLocker"
+                    }
+                    else {
+                        # OK/INFO: enforcement configured but AppIDSvc is not auto-start
+                        & $emit 'Security' (& $toSev $sevAppLockerConfigured) "AppLocker EnforcementMode set for: $($enforcedCols -join ', ') but AppIDSvc is not auto-start (Start=$($script:_sysCheckAppIdSvcStart)) - rules will not be enforced at runtime"
+                    }
                 }
                 else {
                     & $emit 'Security' 'OK' 'AppLocker is not enforcing any rule collections'
@@ -6538,11 +6780,22 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
                 @{ Name = 'bootx64.efi'; Path = (Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi'); Category = 'Boot Loader' }
             )
         }
+        # Azure/Hyper-V critical drivers - missing any of these will BSOD or cripple the VM
+        # Only includes inbox Hyper-V drivers present on every guest; storflt/vmstorfl are
+        # Azure-agent or version-specific and checked conditionally in GetBootPathReport instead.
+        $azureCriticalDrivers = @(
+            @{ Name = 'vmbus.sys';    Desc = 'Hyper-V VMBus' }
+            @{ Name = 'storvsc.sys';  Desc = 'Hyper-V Storage' }
+            @{ Name = 'netvsc.sys';   Desc = 'Hyper-V Network' }
+        )
+        foreach ($drv in $azureCriticalDrivers) {
+            $checks += @{ Name = $drv.Name; Path = (Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($drv.Name)"); Category = "Azure Driver ($($drv.Desc))" }
+        }
 
         $rows = foreach ($c in $checks) {
             $exists = Test-Path -LiteralPath $c.Path
             $size = if ($exists) { (Get-Item -LiteralPath $c.Path -Force -ErrorAction SilentlyContinue).Length } else { 0 }
-            # Signature check for existing non-zero binaries (skip BCD store — it's not a PE)
+            # Signature check for existing non-zero binaries (skip BCD store  -  it's not a PE)
             $sigStatus = ''
             if ($exists -and $size -gt 0 -and $c.Name -ne 'BCD store') {
                 $sig = Test-MicrosoftSignature -FilePath $c.Path
@@ -6638,13 +6891,20 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             $candidates = [System.Collections.Generic.List[PSCustomObject]]::new()
 
             # Search WinSxS
+            # Skip \f\ and \r\ subdirectories - these contain forward/reverse
+            # delta patches (not usable PE binaries).
+            # Also skip tiny files (<1KB) with no version info - these are delta
+            # compression stubs that replaced the original binary in superseded
+            # component folders.
             $winsxsDir = Join-Path $winRoot 'WinSxS'
             if (Test-Path $winsxsDir) {
                 Write-Host "  Searching WinSxS..." -ForegroundColor DarkGray
                 Get-ChildItem -Path $winsxsDir -Filter $fileName -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -gt 0 } |
+                Where-Object { $_.Length -gt 0 -and $_.DirectoryName -notmatch '\\(f|r)$' } |
                 ForEach-Object {
                     $ver = $_.VersionInfo
+                    # Filter out delta stubs: no version info + under 1KB = not a real PE binary
+                    if ($_.Length -lt 1024 -and -not $ver.FileVersion) { return }
                     $candidates.Add([PSCustomObject]@{
                             Path       = $_.FullName
                             Size       = $_.Length
@@ -6694,8 +6954,14 @@ to .disabled extension. Does NOT remove them; they can be re-enabled by renaming
             @{L = 'Path'; E = { $_.Path } } -AutoSize
 
             # -- 3. Pick the best candidate ---------------------------------------
-            # Prefer: newest LastWriteTime, then largest size (more complete binary)
-            $best = $candidates | Sort-Object @{Expression = 'LastWrite'; Descending = $true }, @{Expression = 'Size'; Descending = $true } | Select-Object -First 1
+            # Prefer candidates with valid version info (real PE binaries),
+            # then largest size (most complete), then newest date.
+            # Files without version info are likely delta stubs or placeholders.
+            $best = $candidates |
+                Sort-Object @{Expression = { if ($_.Version -and $_.Company) { 0 } else { 1 } } },
+                            @{Expression = 'Size'; Descending = $true },
+                            @{Expression = 'LastWrite'; Descending = $true } |
+                Select-Object -First 1
 
             Write-Host "  Selected: $($best.Path)" -ForegroundColor Cyan
             Write-Host "    Version: $($best.Version)  |  Size: $("{0:N0}" -f $best.Size) bytes  |  Date: $($best.LastWrite.ToString('yyyy-MM-dd HH:mm'))  |  Company: $($best.Company)" -ForegroundColor White
@@ -6900,6 +7166,961 @@ Use this when stale proxy/PAC settings prevent WinRM/RDP reachability after migr
             }
         }
     }
+
+    function GetBootPathReport {
+        <#
+        .SYNOPSIS
+            Boot Path Health Check  -  traces the full Windows boot chain on the offline disk
+            and validates every artifact (file, registry key, driver, service) in load order.
+
+            Phases:
+                1  Pre-Boot (BIOS/UEFI firmware + MBR/GPT partition table)
+                2  Boot Manager (bootmgr/bootmgfw.efi -> BCD store)
+                3  OS Loader (winload.exe/.efi -> kernel, HAL, SYSTEM hive, boot-start drivers)
+                4  NTOS Kernel Init (Session Manager, Csrss, Wininit, Services.exe, boot/system drivers)
+                5  Logon & Desktop (Winlogon, LogonUI, Lsass, Userinit, Explorer shell)
+
+            For each artifact the report shows:
+                * Load order position within its phase
+                * Expected file path on the offline disk
+                * Exists / Missing / 0-byte status
+                * File size and Microsoft signature verification
+                * Registry configuration that references it (when applicable)
+                * Health verdict:  OK / WARN / FAIL
+        #>
+
+        #region -- colour / symbol helpers ----------------------------------------
+        $symOK    = [char]0x2714   # check mark
+        $symFAIL  = [char]0x2718   # X mark
+        $symWARN  = [char]0x26A0   # warning sign
+        $symINFO  = [char]0x2139   # info
+        $symARROW = [char]0x25B6   # right-pointing triangle
+        $symCHAIN = [char]0x2502   # vertical line for chain visual
+        $symLINK  = [char]0x251C   # tee connector
+        $symEND   = [char]0x2514   # corner connector
+        $symEQ    = [char]0x2550   # double horizontal line
+        $symVert  = [char]0x2551   # double vertical line
+        $symTL    = [char]0x2554   # top-left corner
+        $symBL    = [char]0x255A   # bottom-left corner
+
+        function Write-Phase {
+            param([int]$Number, [string]$Title, [string]$Description)
+            $bar = "  $symTL$("$symEQ" * 76)"
+            $end = "  $symBL$("$symEQ" * 76)"
+            Write-Host ""
+            Write-Host $bar -ForegroundColor DarkCyan
+            Write-Host "  $symVert  PHASE $Number - $Title" -ForegroundColor Cyan
+            Write-Host "  $symVert  $Description" -ForegroundColor DarkGray
+            Write-Host $end -ForegroundColor DarkCyan
+        }
+
+        function Write-ChainItem {
+            param(
+                [string]$Label,
+                [string]$Status,        # OK, WARN, FAIL, INFO
+                [string]$Detail = '',
+                [switch]$IsLast
+            )
+            $connector = if ($IsLast) { $symEND } else { $symLINK }
+            switch ($Status) {
+                'OK'   { $icon = $symOK;   $col = 'Green'  }
+                'WARN' { $icon = $symWARN; $col = 'Yellow' }
+                'FAIL' { $icon = $symFAIL; $col = 'Red'    }
+                'INFO' { $icon = $symINFO; $col = 'DarkGray' }
+                default { $icon = $symARROW; $col = 'White' }
+            }
+            Write-Host "  $symCHAIN" -ForegroundColor DarkGray -NoNewline
+            Write-Host "  $connector " -ForegroundColor DarkGray -NoNewline
+            Write-Host "$icon " -ForegroundColor $col -NoNewline
+            Write-Host "$Label" -ForegroundColor White -NoNewline
+            if ($Detail) { Write-Host "  $Detail" -ForegroundColor DarkGray }
+            else { Write-Host "" }
+        }
+
+        function Test-BootFile {
+            param([string]$Path, [string]$Label, [switch]$SkipSignature)
+            $obj = [PSCustomObject]@{
+                Label     = $Label
+                Path      = $Path
+                Exists    = $false
+                Size      = 0
+                SizeStr   = ''
+                SigStatus = ''
+                IsMicrosoft = $false
+                Health    = 'FAIL'
+                Detail    = ''
+            }
+            if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+                $obj.Detail = "MISSING  -  $Path"
+                return $obj
+            }
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            $obj.Exists = $true
+            $obj.Size = if ($item) { $item.Length } else { 0 }
+            $obj.SizeStr = '{0:N0}' -f $obj.Size
+
+            if ($obj.Size -eq 0) {
+                $obj.Health = 'FAIL'
+                $obj.Detail = "0 BYTES (corrupt)  -  $Path"
+                return $obj
+            }
+
+            if (-not $SkipSignature) {
+                $sig = Test-MicrosoftSignature -FilePath $Path
+                $obj.SigStatus = $sig.Status
+                $obj.IsMicrosoft = $sig.IsMicrosoft
+                if (-not $sig.IsMicrosoft -and -not $sig.IsSigned) {
+                    $obj.Health = 'WARN'
+                    $obj.Detail = "Not signed ($($sig.Status))  -  $Path ($($obj.SizeStr) bytes)"
+                    return $obj
+                }
+                elseif (-not $sig.IsMicrosoft -and $sig.IsSigned) {
+                    $obj.Health = 'WARN'
+                    $obj.Detail = "Signed by '$($sig.Subject)' (not Microsoft)  -  $Path ($($obj.SizeStr) bytes)"
+                    return $obj
+                }
+            }
+
+            $obj.Health = 'OK'
+            $obj.Detail = "$Path ($($obj.SizeStr) bytes)"
+            return $obj
+        }
+        #endregion
+
+        # Accumulate issues for the summary
+        $issues = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $totalChecks = 0
+
+        Write-Host ""
+        Write-Host "  $("$symEQ" * 76)" -ForegroundColor Cyan
+        Write-Host "                     WINDOWS BOOT PATH HEALTH CHECK" -ForegroundColor White
+        Write-Host "  $("$symEQ" * 76)" -ForegroundColor Cyan
+        $genLabel = if ($script:VMGen -eq 2) { 'Generation 2 (UEFI / GPT)' } else { 'Generation 1 (BIOS / MBR)' }
+        Write-Host "  VM Generation  : $genLabel" -ForegroundColor DarkGray
+        Write-Host "  Windows Drive  : $($script:WinDriveLetter)" -ForegroundColor DarkGray
+        Write-Host "  Boot Drive     : $($script:BootDriveLetter)" -ForegroundColor DarkGray
+
+        #region ===================================================================
+        # PHASE 1  -  PRE-BOOT: Partition Table & Disk Layout
+        #=========================================================================
+        Write-Phase 1 'PRE-BOOT' 'Firmware POST -> partition table -> identify boot partition'
+
+        $disk = Get-Disk -Number $script:DiskNumber -ErrorAction SilentlyContinue
+        $partStyle = if ($disk) { $disk.PartitionStyle } else { 'Unknown' }
+        Write-ChainItem -Label "Partition style: $partStyle" -Status 'INFO'
+
+        $partitions = Get-Partition -DiskNumber $script:DiskNumber -ErrorAction SilentlyContinue
+        $bootPartFound = $false
+        $winPartFound = $false
+
+        foreach ($part in $partitions) {
+            $access = ($part.AccessPaths | Where-Object { $_ -match '^[A-Z]:\\$' }) | Select-Object -First 1
+            if (-not $access) { continue }
+            $accessClean = $access.TrimEnd('\')
+
+            $isBootPart = ($accessClean -eq $script:BootDriveLetter.TrimEnd('\'))
+            $isWinPart  = ($accessClean -eq $script:WinDriveLetter.TrimEnd('\'))
+
+            $roles = @()
+            if ($isBootPart) { $roles += 'BOOT'; $bootPartFound = $true }
+            if ($isWinPart)  { $roles += 'WINDOWS'; $winPartFound = $true }
+            if ($roles.Count -eq 0) { continue }
+
+            $roleStr = $roles -join ' + '
+            $sizeGB  = '{0:N2} GB' -f ($part.Size / 1GB)
+
+            # Boot partition health checks
+            if ($isBootPart) {
+                if ($script:VMGen -eq 1) {
+                    $actStatus = if ($part.IsActive) { 'OK' } else { 'FAIL' }
+                    Write-ChainItem -Label "Partition $($part.PartitionNumber) [$roleStr]  -  $sizeGB" -Status $actStatus -Detail $(if ($part.IsActive) { '(Active flag set)' } else { 'Active flag NOT set  -  firmware cannot find this partition' })
+                    if (-not $part.IsActive) {
+                        $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 1; Severity = 'FAIL'; Message = "Boot partition $($part.PartitionNumber) missing Active flag"; Fix = '-FixBoot' })
+                    }
+                }
+                else {
+                    $typeLabel = if ($part.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}') { 'EFI System Partition' } else { $part.GptType }
+                    Write-ChainItem -Label "Partition $($part.PartitionNumber) [$roleStr]  -  $sizeGB  -  $typeLabel" -Status 'OK'
+                }
+            }
+            if ($isWinPart -and -not $isBootPart) {
+                Write-ChainItem -Label "Partition $($part.PartitionNumber) [$roleStr]  -  $sizeGB" -Status 'OK'
+            }
+        }
+
+        if (-not $bootPartFound) {
+            Write-ChainItem -Label 'Boot partition' -Status 'FAIL' -Detail 'NOT FOUND  -  firmware has no partition to start from' -IsLast
+            $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 1; Severity = 'FAIL'; Message = 'No boot partition found'; Fix = '-RecreateBootPartition' })
+        }
+        if (-not $winPartFound) {
+            Write-ChainItem -Label 'Windows partition' -Status 'FAIL' -Detail 'NOT FOUND  -  no partition contains Windows\System32' -IsLast
+            $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 1; Severity = 'FAIL'; Message = 'No Windows partition found'; Fix = '' })
+        }
+        $totalChecks += 2  # boot + win partition
+
+        #endregion
+
+        #region ===================================================================
+        # PHASE 2  -  BOOT MANAGER: bootmgr / BCD Store
+        #=========================================================================
+        Write-Phase 2 'BOOT MANAGER' 'Firmware loads boot manager -> reads BCD -> selects OS entry'
+
+        # 2a. Boot manager binary
+        $bootMgrFiles = @()
+        if ($script:VMGen -eq 1) {
+            $bootMgrFiles += @{ Label = 'bootmgr'; Path = (Join-Path $script:BootDriveLetter 'bootmgr') }
+        }
+        else {
+            $bootMgrFiles += @{ Label = 'bootmgfw.efi'; Path = (Join-Path $script:BootDriveLetter 'EFI\Microsoft\Boot\bootmgfw.efi') }
+            $bootMgrFiles += @{ Label = 'bootx64.efi (fallback)'; Path = (Join-Path $script:BootDriveLetter 'EFI\Boot\bootx64.efi') }
+        }
+        foreach ($bmf in $bootMgrFiles) {
+            $r = Test-BootFile -Path $bmf.Path -Label $bmf.Label
+            Write-ChainItem -Label "$($bmf.Label)" -Status $r.Health -Detail $r.Detail
+            $totalChecks++
+            if ($r.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 2; Severity = $r.Health; Message = "$($bmf.Label): $($r.Detail)"; Fix = '-FixBoot' }) }
+        }
+
+        # 2b. BCD store
+        $bcdStore = Get-BcdStorePath -BootDrive $script:BootDriveLetter -Generation $script:VMGen
+        $bcdResult = Test-BootFile -Path $bcdStore -Label 'BCD store' -SkipSignature
+        Write-ChainItem -Label "BCD store" -Status $bcdResult.Health -Detail $bcdResult.Detail
+        $totalChecks++
+        if ($bcdResult.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 2; Severity = $bcdResult.Health; Message = "BCD store: $($bcdResult.Detail)"; Fix = '-FixBoot' }) }
+
+        # 2c. Parse BCD entries if store exists
+        $bcdWinloadPath = $null
+        $bcdSystemRoot = '\Windows'
+        $bcdFlags = @()
+        if ($bcdResult.Exists -and $bcdResult.Size -gt 0) {
+            try {
+                $bcdText = (& bcdedit.exe /store "$bcdStore" /enum all 2>&1) | Out-String
+
+                # Boot Manager section
+                $bmgrTimeout = if ($bcdText -match '(?im)timeout\s+(\d+)') { $Matches[1] + 's' } else { 'default' }
+                Write-ChainItem -Label "BCD timeout: $bmgrTimeout" -Status 'INFO'
+
+                # Extract Boot Manager section and validate its path
+                $bmgrSection = ''
+                $allSections = $bcdText -split '(?m)^-{3,}'
+                foreach ($sec in $allSections) {
+                    if ($sec -match 'bootmgr|Windows Boot Manager') {
+                        $bmgrSection = $sec
+                        break
+                    }
+                }
+                if ($bmgrSection) {
+                    $bmgrPath = if ($bmgrSection -match '(?im)^\s*path\s+(.+)$') { $Matches[1].Trim() } else { '' }
+                    if ($bmgrPath) {
+                        $expectedBmgr = if ($script:VMGen -eq 2) { '\EFI\Microsoft\Boot\bootmgfw.efi' } else { '\bootmgr' }
+                        Write-ChainItem -Label "Boot Manager path : $bmgrPath" -Status 'INFO'
+                        if (-not [string]::Equals($bmgrPath, $expectedBmgr, [System.StringComparison]::OrdinalIgnoreCase)) {
+                            Write-ChainItem -Label "Boot Manager path mismatch" -Status 'WARN' -Detail "Expected '$expectedBmgr', found '$bmgrPath'"
+                            $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = "Boot Manager path is '$bmgrPath' (expected '$expectedBmgr')"; Fix = '-FixBoot' })
+                        }
+                    }
+                }
+
+                # Windows Boot Loader section
+                $hasLoader = $bcdText -match 'Windows Boot Loader|osloader'
+                if (-not $hasLoader) {
+                    Write-ChainItem -Label 'Windows Boot Loader entry' -Status 'FAIL' -Detail 'No osloader/Windows Boot Loader entry found in BCD'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'FAIL'; Message = 'No Windows Boot Loader entry in BCD'; Fix = '-FixBoot' })
+                }
+                else {
+                    Write-ChainItem -Label 'Windows Boot Loader entry present' -Status 'OK'
+
+                    # Extract key BCD values from the OS Loader section (not Boot Manager)
+                    # Split the full BCD output into sections; find the Windows Boot Loader block
+                    $loaderSection = ''
+                    $sections = $bcdText -split '(?m)^-{3,}'
+                    foreach ($sec in $sections) {
+                        if ($sec -match 'osloader|Windows Boot Loader') {
+                            $loaderSection = $sec
+                            break
+                        }
+                    }
+                    if (-not $loaderSection) { $loaderSection = $bcdText }
+
+                    $bcdDevice   = if ($loaderSection -match '(?im)^\s*device\s+(.+)$') { $Matches[1].Trim() } else { '' }
+                    $bcdOsDevice = if ($loaderSection -match '(?im)^\s*osdevice\s+(.+)$') { $Matches[1].Trim() } else { '' }
+                    $bcdPath     = if ($loaderSection -match '(?im)^\s*path\s+(.+)$') { $Matches[1].Trim() } else { '' }
+                    $bcdSysRoot  = if ($loaderSection -match '(?im)^\s*systemroot\s+(.+)$') { $Matches[1].Trim() } else { '\Windows' }
+                    $bcdNx       = if ($loaderSection -match '(?im)^\s*nx\s+(.+)$') { $Matches[1].Trim() } else { '' }
+
+                    $bcdWinloadPath = $bcdPath
+                    $bcdSystemRoot = $bcdSysRoot
+
+                    Write-ChainItem -Label "device     : $bcdDevice" -Status 'INFO'
+                    Write-ChainItem -Label "osdevice   : $bcdOsDevice" -Status 'INFO'
+                    Write-ChainItem -Label "path       : $bcdPath" -Status 'INFO'
+                    Write-ChainItem -Label "systemroot : $bcdSysRoot" -Status 'INFO'
+                    if ($bcdNx) { Write-ChainItem -Label "nx         : $bcdNx" -Status 'INFO' }
+
+                    # Device pointing to unknown
+                    if ($bcdDevice -match '\bunknown\b' -or $bcdOsDevice -match '\bunknown\b') {
+                        Write-ChainItem -Label 'BCD device references UNKNOWN partition' -Status 'FAIL' -Detail 'device/osdevice points to missing or wrong partition'
+                        $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'FAIL'; Message = 'BCD device/osdevice references unknown partition'; Fix = '-FixBoot' })
+                    }
+
+                    # Path mismatch for Gen
+                    $expectedLoader = if ($script:VMGen -eq 2) { '\Windows\System32\winload.efi' } else { '\Windows\System32\winload.exe' }
+                    if ($bcdPath -and -not [string]::Equals($bcdPath, $expectedLoader, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        Write-ChainItem -Label "BCD path mismatch" -Status 'WARN' -Detail "Expected '$expectedLoader', found '$bcdPath'"
+                        $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = "BCD loader path is '$bcdPath' (expected '$expectedLoader')"; Fix = '-FixBoot' })
+                    }
+                }
+
+                # BCD flags that affect boot behaviour
+                if ($bcdText -match 'safeboot\s+(\S+)') {
+                    $bcdFlags += "SafeMode=$($Matches[1])"
+                    Write-ChainItem -Label "Safe Mode flag active ($($Matches[1]))" -Status 'WARN' -Detail 'VM will boot into Safe Mode'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = "SafeMode boot flag is set ($($Matches[1]))"; Fix = '-RemoveSafeModeFlag' })
+                }
+                if ($bcdText -match 'testsigning\s+yes') {
+                    $bcdFlags += 'TestSigning'
+                    Write-ChainItem -Label 'Test Signing is ON' -Status 'WARN' -Detail 'Unsigned drivers are allowed to load'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = 'Test signing is enabled'; Fix = '-DisableTestSigning' })
+                }
+                if ($bcdText -match 'nointegritychecks\s+yes') {
+                    $bcdFlags += 'NoIntegrityChecks'
+                    Write-ChainItem -Label 'nointegritychecks is ON' -Status 'WARN' -Detail 'Code integrity checks bypassed; FATAL with Secure Boot'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'WARN'; Message = 'nointegritychecks is ON'; Fix = '-FixBoot' })
+                }
+                if ($bcdText -match 'recoveryenabled\s+no') {
+                    $bcdFlags += 'RecoveryDisabled'
+                    Write-ChainItem -Label 'Recovery is disabled' -Status 'WARN' -Detail 'WinRE recovery environment will not launch on failure'
+                }
+                if ($bcdText -match 'bootstatuspolicy\s+ignoreallfailures') {
+                    $bcdFlags += 'IgnoreAllFailures'
+                    Write-ChainItem -Label 'bootstatuspolicy: IgnoreAllFailures' -Status 'INFO' -Detail 'Startup repair suppressed on failure'
+                }
+                if ($bcdText -match 'bootlog\s+yes') {
+                    $bcdFlags += 'BootLog'
+                    Write-ChainItem -Label 'Boot logging enabled' -Status 'INFO' -Detail 'ntbtlog.txt will be created on boot'
+                }
+                if ($bcdText -match '(?im)^\s*debug\s+Yes') {
+                    $bcdFlags += 'KernelDebug'
+                    Write-ChainItem -Label 'Kernel debugging enabled' -Status 'INFO'
+                }
+                if ($bcdText -match 'imcdevice|imchivename') {
+                    $bcdFlags += 'IMC-Hive'
+                    Write-ChainItem -Label 'IMC hive (imcdevice/imchivename) in BCD' -Status 'FAIL' -Detail 'Causes BSOD 0x67 CONFIG_INITIALIZATION_FAILED'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 2; Severity = 'FAIL'; Message = 'BCD contains IMC hive entries  -  causes BSOD 0x67'; Fix = '-FixBoot' })
+                }
+
+                # Resume object (hibernate)
+                if ($bcdText -match 'resumeobject') {
+                    Write-ChainItem -Label 'Resume from Hibernation entry present' -Status 'INFO'
+                }
+            }
+            catch {
+                Write-ChainItem -Label "BCD parse error: $_" -Status 'WARN'
+            }
+        }
+
+        #endregion
+
+        #region ===================================================================
+        # PHASE 3  -  OS LOADER: winload -> Kernel + HAL + SYSTEM hive + Boot drivers
+        #=========================================================================
+        Write-Phase 3 'OS LOADER' 'winload loads kernel, HAL, SYSTEM hive, registry, boot-start drivers (Start=0)'
+
+        # 3a. winload binary
+        $winloadPath = if ($script:VMGen -eq 2) { 'Windows\System32\winload.efi' } else { 'Windows\System32\winload.exe' }
+        $winloadFull = Join-Path $script:WinDriveLetter $winloadPath
+        $winloadName = if ($script:VMGen -eq 2) { 'winload.efi' } else { 'winload.exe' }
+        $r = Test-BootFile -Path $winloadFull -Label $winloadName
+        Write-ChainItem -Label "$winloadName (OS Loader)" -Status $r.Health -Detail $r.Detail
+        $totalChecks++
+        if ($r.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 3; Severity = $r.Health; Message = "$winloadName : $($r.Detail)"; Fix = '-FixBoot' }) }
+
+        # 3b. Kernel and HAL
+        $kernelFiles = @(
+            @{ Label = 'ntoskrnl.exe (Windows Kernel)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntoskrnl.exe') }
+            @{ Label = 'hal.dll (Hardware Abstraction Layer)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\hal.dll') }
+            @{ Label = 'ci.dll (Code Integrity)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ci.dll') }
+            @{ Label = 'clfs.sys (Common Log File System)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\drivers\clfs.sys') }
+            @{ Label = 'pshed.dll (Platform-Specific HW Error Driver)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\pshed.dll') }
+            @{ Label = 'bootvid.dll (Boot Video Driver)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\bootvid.dll') }
+        )
+        foreach ($kf in $kernelFiles) {
+            $r = Test-BootFile -Path $kf.Path -Label $kf.Label
+            Write-ChainItem -Label $kf.Label -Status $r.Health -Detail $r.Detail
+            $totalChecks++
+            if ($r.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 3; Severity = $r.Health; Message = "$($kf.Label): $($r.Detail)"; Fix = "-RepairSystemFile $(Split-Path -Leaf $kf.Path)" }) }
+        }
+
+        # 3c. SYSTEM registry hive
+        $sysHivePath = Join-Path $script:WinDriveLetter 'Windows\System32\config\SYSTEM'
+        $sysHiveResult = Test-BootFile -Path $sysHivePath -Label 'SYSTEM registry hive' -SkipSignature
+        Write-ChainItem -Label 'SYSTEM registry hive' -Status $sysHiveResult.Health -Detail $sysHiveResult.Detail
+        $totalChecks++
+        if ($sysHiveResult.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 3; Severity = 'FAIL'; Message = "SYSTEM hive: $($sysHiveResult.Detail)"; Fix = '-RestoreRegistryFromRegBack' }) }
+
+        # 3d. Boot-start drivers (Start=0)  -  loaded by winload before kernel takes over
+        Write-Host ""
+        Write-Host "  $symCHAIN  $symARROW  Boot-Start Drivers (Start=0)  -  loaded by $winloadName before kernel init" -ForegroundColor White
+
+        $bootDriverResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $bootDriverFail = 0
+        $bootDriverWarn = 0
+
+        Invoke-WithHive 'SYSTEM' {
+            $sysRoot = Get-SystemRootPath
+            $svcPath = "$sysRoot\Services"
+            $startNames = @{ 0 = 'Boot'; 1 = 'System'; 2 = 'Automatic'; 3 = 'Manual'; 4 = 'Disabled' }
+            $typeNames  = @{ 1 = 'Kernel'; 2 = 'FileSystem'; 4 = 'Adapter'; 8 = 'Recognizer' }
+            $errorCtlNames = @{ 0 = 'Ignore'; 1 = 'Normal'; 2 = 'Severe'; 3 = 'Critical' }
+
+            # Drivers that are functionally critical on Azure/Hyper-V regardless of ErrorControl.
+            # Missing any of these will BSOD the VM (e.g. 0x7B INACCESSIBLE_BOOT_DEVICE) even
+            # though their ErrorControl may be Normal (1).
+            $azureCriticalDrivers = @('vmbus', 'storvsc', 'storflt', 'vmstorfl', 'netvsc')
+
+            # Enumerate Start=0 (boot) drivers
+            $bootDrivers = @()
+            Get-ChildItem $svcPath -ErrorAction SilentlyContinue | ForEach-Object {
+                $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                if ($null -eq $p -or $null -eq $p.Start -or $null -eq $p.Type) { return }
+                if ([int]$p.Start -ne 0) { return }
+                if ([int]$p.Type -notin @(1, 2, 4, 8)) { return }  # Drivers only
+                $bootDrivers += [PSCustomObject]@{
+                    Name         = $_.PSChildName
+                    Type         = $typeNames[[int]$p.Type]
+                    Group        = if ($p.Group) { $p.Group } else { '(none)' }
+                    ErrorControl = if ($null -ne $p.ErrorControl) { [int]$p.ErrorControl } else { 1 }
+                    ErrorCtlName = $errorCtlNames[$(if ($null -ne $p.ErrorControl) { [int]$p.ErrorControl } else { 1 })]
+                    ImagePath    = $p.ImagePath
+                    Tag          = if ($null -ne $p.Tag) { [int]$p.Tag } else { 9999 }
+                }
+            }
+
+            # Sort by Group then Tag (mimics Windows boot driver load order)
+            # Read ServiceGroupOrder from registry for authentic ordering
+            $groupOrderPath = "$sysRoot\Control\ServiceGroupOrder"
+            $groupList = @()
+            if (Test-Path $groupOrderPath) {
+                $groupList = @((Get-ItemProperty $groupOrderPath -ErrorAction SilentlyContinue).List)
+            }
+            # Build group priority map
+            $groupPriority = @{}
+            for ($i = 0; $i -lt $groupList.Count; $i++) { $groupPriority[$groupList[$i]] = $i }
+
+            $bootDrivers = $bootDrivers | Sort-Object @{
+                Expression = { if ($groupPriority.ContainsKey($_.Group)) { $groupPriority[$_.Group] } else { 9999 } }
+            }, Tag
+
+            $currentGroup = ''
+            foreach ($drv in $bootDrivers) {
+                if ($drv.Group -ne $currentGroup) {
+                    $currentGroup = $drv.Group
+                    Write-Host "  $symCHAIN      -- Group: $currentGroup --" -ForegroundColor DarkCyan
+                }
+                # Windows default: if ImagePath is absent, the driver file is System32\Drivers\<name>.sys
+                $imgResolved = if ($drv.ImagePath) {
+                    Resolve-GuestImagePath $drv.ImagePath
+                } else {
+                    Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($drv.Name).sys"
+                }
+                $fileExists = if ($imgResolved) { Test-Path -LiteralPath $imgResolved } else { $false }
+                $fileSize = if ($fileExists) { (Get-Item -LiteralPath $imgResolved -Force -ErrorAction SilentlyContinue).Length } else { 0 }
+
+                $health = 'OK'
+                $detail = ''
+                $isAzureCritical = $azureCriticalDrivers -contains $drv.Name
+                if (-not $imgResolved -or -not $fileExists) {
+                    $health = if ($drv.ErrorControl -ge 2 -or $isAzureCritical) { 'FAIL' } else { 'WARN' }
+                    $detail = "MISSING binary  -  ErrorControl=$($drv.ErrorCtlName)"
+                    if ($isAzureCritical) { $detail += ' (Azure/Hyper-V critical  -  will BSOD)' }
+                    elseif ($drv.ErrorControl -ge 3) { $detail += ' (CRITICAL  -  will BSOD)' }
+                    elseif ($drv.ErrorControl -ge 2) { $detail += ' (SEVERE  -  LKGC fallback)' }
+                }
+                elseif ($fileSize -eq 0) {
+                    $health = if ($drv.ErrorControl -ge 2 -or $isAzureCritical) { 'FAIL' } else { 'WARN' }
+                    $detail = "0 BYTES (corrupt)  -  ErrorControl=$($drv.ErrorCtlName)"
+                    if ($isAzureCritical) { $detail += ' (Azure/Hyper-V critical  -  will BSOD)' }
+                }
+                else {
+                    # Spot-check signature for non-Microsoft drivers
+                    $vi = (Get-Item -LiteralPath $imgResolved -Force -ErrorAction SilentlyContinue).VersionInfo
+                    $vendor = if ($vi -and $vi.CompanyName) { $vi.CompanyName.Trim() } else { '' }
+                    if ($vendor -and $vendor -notmatch 'Microsoft') {
+                        $detail = "3rd-party ($vendor)"
+                    }
+                    else {
+                        $detail = if ($imgResolved) { "$('{0:N0}' -f $fileSize) bytes" } else { '' }
+                    }
+                }
+
+                $label = "$($drv.Name) ($($drv.Type))"
+                Write-Host "  $symCHAIN      " -ForegroundColor DarkGray -NoNewline
+                switch ($health) {
+                    'OK'   { Write-Host "$symOK " -ForegroundColor Green -NoNewline }
+                    'WARN' { Write-Host "$symWARN " -ForegroundColor Yellow -NoNewline }
+                    'FAIL' { Write-Host "$symFAIL " -ForegroundColor Red -NoNewline }
+                }
+                Write-Host "$label" -ForegroundColor White -NoNewline
+                if ($detail) { Write-Host "  $detail" -ForegroundColor DarkGray } else { Write-Host "" }
+
+                $totalChecks++
+                if ($health -eq 'FAIL') {
+                    $bootDriverFail++
+                    $issues.Add([PSCustomObject]@{ Phase = 3; Severity = 'FAIL'; Message = "Boot driver '$($drv.Name)': $detail"; Fix = "-RepairSystemFile $(Split-Path -Leaf $drv.ImagePath)" })
+                }
+                elseif ($health -eq 'WARN') {
+                    $bootDriverWarn++
+                    $issues.Add([PSCustomObject]@{ Phase = 3; Severity = 'WARN'; Message = "Boot driver '$($drv.Name)': $detail"; Fix = '' })
+                }
+            }
+
+            Write-Host "  $symCHAIN      -- $($bootDrivers.Count) boot-start drivers ($bootDriverFail fail, $bootDriverWarn warn) --" -ForegroundColor DarkGray
+
+            #region ===============================================================
+            # PHASE 4  -  NTOS KERNEL INIT: Session Manager, system drivers, services
+            #=====================================================================
+            Write-Phase 4 'NTOS KERNEL' 'Kernel init -> Session Manager -> Csrss -> Wininit -> Services.exe -> system drivers (Start=1)'
+
+            # 4a. Core kernel-phase executables
+            $kernelInitFiles = @(
+                @{ Label = 'ntdll.dll (NT Layer DLL)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\ntdll.dll') }
+                @{ Label = 'smss.exe (Session Manager)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\smss.exe') }
+                @{ Label = 'csrss.exe (Client/Server Runtime)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\csrss.exe') }
+                @{ Label = 'wininit.exe (Windows Init Process)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\wininit.exe') }
+                @{ Label = 'services.exe (Service Control Manager)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\services.exe') }
+                @{ Label = 'lsass.exe (Local Security Authority)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\lsass.exe') }
+                @{ Label = 'svchost.exe (Service Host)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\svchost.exe') }
+                @{ Label = 'kernel32.dll (Win32 Kernel)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\kernel32.dll') }
+                @{ Label = 'KernelBase.dll (Kernel Base)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\KernelBase.dll') }
+                @{ Label = 'advapi32.dll (Advanced API)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\advapi32.dll') }
+                @{ Label = 'rpcrt4.dll (RPC Runtime)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\rpcrt4.dll') }
+            )
+            foreach ($kif in $kernelInitFiles) {
+                $r = Test-BootFile -Path $kif.Path -Label $kif.Label
+                Write-ChainItem -Label $kif.Label -Status $r.Health -Detail $r.Detail
+                $totalChecks++
+                if ($r.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 4; Severity = $r.Health; Message = "$($kif.Label): $($r.Detail)"; Fix = "-RepairSystemFile $(Split-Path -Leaf $kif.Path)" }) }
+            }
+
+            # 4b. Session Manager registry configuration
+            Write-Host ""
+            Write-Host "  $symCHAIN  $symARROW  Session Manager Configuration (BootExecute / SetupExecute)" -ForegroundColor White
+            $smPath = "$sysRoot\Control\Session Manager"
+            if (Test-Path $smPath) {
+                $smProps = Get-ItemProperty $smPath -ErrorAction SilentlyContinue
+                $sys32Path = Join-Path $script:WinDriveLetter 'Windows\System32'
+
+                # BootExecute
+                $bootExec = @($smProps.BootExecute | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                if ($bootExec.Count -eq 0) {
+                    Write-ChainItem -Label 'BootExecute: (empty)' -Status 'WARN' -Detail 'Missing default autocheck entry'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'WARN'; Message = 'BootExecute is empty (missing autocheck autochk *)'; Fix = '-FixSessionManager' })
+                }
+                else {
+                    foreach ($entry in $bootExec) {
+                        $nativeName = ($entry -split '\s+', 2)[0]
+                        $nativePath = Join-Path $sys32Path "$nativeName.exe"
+                        $isDefault = ($entry -match '^autocheck\s+autochk')
+                        if ($isDefault) {
+                            $exists = Test-Path -LiteralPath (Join-Path $sys32Path 'autochk.exe')
+                            Write-ChainItem -Label "BootExecute: $entry" -Status $(if ($exists) { 'OK' } else { 'FAIL' }) -Detail $(if (-not $exists) { 'autochk.exe MISSING' } else { '' })
+                            $totalChecks++
+                            if (-not $exists) { $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'FAIL'; Message = 'autochk.exe missing for BootExecute'; Fix = '-RepairSystemFile autochk.exe' }) }
+                        }
+                        else {
+                            $exists = Test-Path -LiteralPath $nativePath
+                            $status = if (-not $exists) { 'WARN' } else { 'INFO' }
+                            Write-ChainItem -Label "BootExecute: $entry" -Status $status -Detail $(if (-not $exists) { "Binary $nativeName.exe MISSING (third-party)" } else { '(non-default entry)' })
+                            $totalChecks++
+                            if (-not $exists) { $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'WARN'; Message = "BootExecute entry '$entry' references missing binary $nativeName.exe"; Fix = '-FixSessionManager' }) }
+                        }
+                    }
+                }
+
+                # SetupExecute (should be empty after setup completes)
+                $setupExec = @($smProps.SetupExecute | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+                if ($setupExec.Count -gt 0) {
+                    foreach ($entry in $setupExec) {
+                        Write-ChainItem -Label "SetupExecute: $entry" -Status 'WARN' -Detail 'Should be empty on a fully provisioned OS  -  pending setup operation'
+                        $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'WARN'; Message = "SetupExecute is not empty: '$entry'"; Fix = '-FixSessionManager' })
+                    }
+                }
+                else {
+                    Write-ChainItem -Label 'SetupExecute: (empty  -  normal)' -Status 'OK'
+                }
+
+                # PendingFileRenameOperations
+                $pendRenames = @($smProps.PendingFileRenameOperations | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                if ($pendRenames.Count -gt 0) {
+                    Write-ChainItem -Label "PendingFileRenameOperations: $($pendRenames.Count) entries" -Status 'INFO' -Detail 'Pending file renames will execute on boot'
+                }
+
+                # SubSystems  -  required for csrss.exe
+                $requiredSubsys = $smProps.Required
+                if ($requiredSubsys) {
+                    Write-ChainItem -Label "Required SubSystems: $($requiredSubsys -join ', ')" -Status 'INFO'
+                }
+            }
+            else {
+                Write-ChainItem -Label 'Session Manager key' -Status 'FAIL' -Detail 'Registry key not found'
+                $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'FAIL'; Message = 'Session Manager registry key not found'; Fix = '-RestoreRegistryFromRegBack' })
+            }
+
+            # 4c. System-start drivers (Start=1)  -  loaded by kernel after boot-start drivers
+            Write-Host ""
+            Write-Host "  $symCHAIN  $symARROW  System-Start Drivers (Start=1)  -  loaded after kernel takes control" -ForegroundColor White
+
+            $sysDriverFail = 0
+            $sysDriverWarn = 0
+            $sysDrivers = @()
+            Get-ChildItem $svcPath -ErrorAction SilentlyContinue | ForEach-Object {
+                $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                if ($null -eq $p -or $null -eq $p.Start -or $null -eq $p.Type) { return }
+                if ([int]$p.Start -ne 1) { return }
+                if ([int]$p.Type -notin @(1, 2, 4, 8)) { return }
+                $sysDrivers += [PSCustomObject]@{
+                    Name         = $_.PSChildName
+                    Type         = $typeNames[[int]$p.Type]
+                    Group        = if ($p.Group) { $p.Group } else { '(none)' }
+                    ErrorControl = if ($null -ne $p.ErrorControl) { [int]$p.ErrorControl } else { 1 }
+                    ErrorCtlName = $errorCtlNames[$(if ($null -ne $p.ErrorControl) { [int]$p.ErrorControl } else { 1 })]
+                    ImagePath    = $p.ImagePath
+                    Tag          = if ($null -ne $p.Tag) { [int]$p.Tag } else { 9999 }
+                }
+            }
+
+            $sysDrivers = $sysDrivers | Sort-Object @{
+                Expression = { if ($groupPriority.ContainsKey($_.Group)) { $groupPriority[$_.Group] } else { 9999 } }
+            }, Tag
+
+            $currentGroup = ''
+            foreach ($drv in $sysDrivers) {
+                if ($drv.Group -ne $currentGroup) {
+                    $currentGroup = $drv.Group
+                    Write-Host "  $symCHAIN      -- Group: $currentGroup --" -ForegroundColor DarkCyan
+                }
+                # Windows default: if ImagePath is absent, the driver file is System32\Drivers\<name>.sys
+                $imgResolved = if ($drv.ImagePath) {
+                    Resolve-GuestImagePath $drv.ImagePath
+                } else {
+                    Join-Path $script:WinDriveLetter "Windows\System32\drivers\$($drv.Name).sys"
+                }
+                $fileExists = if ($imgResolved) { Test-Path -LiteralPath $imgResolved } else { $false }
+                $fileSize = if ($fileExists) { (Get-Item -LiteralPath $imgResolved -Force -ErrorAction SilentlyContinue).Length } else { 0 }
+
+                $health = 'OK'
+                $detail = ''
+                $isAzureCritical = $azureCriticalDrivers -contains $drv.Name
+                if (-not $imgResolved -or -not $fileExists) {
+                    $health = if ($drv.ErrorControl -ge 2 -or $isAzureCritical) { 'FAIL' } else { 'WARN' }
+                    $detail = "MISSING binary  -  ErrorControl=$($drv.ErrorCtlName)"
+                    if ($isAzureCritical) { $detail += ' (Azure/Hyper-V critical  -  will BSOD)' }
+                    elseif ($drv.ErrorControl -ge 3) { $detail += ' (CRITICAL  -  will BSOD)' }
+                    elseif ($drv.ErrorControl -ge 2) { $detail += ' (SEVERE  -  LKGC fallback)' }
+                }
+                elseif ($fileSize -eq 0) {
+                    $health = if ($drv.ErrorControl -ge 2 -or $isAzureCritical) { 'FAIL' } else { 'WARN' }
+                    $detail = "0 BYTES (corrupt)  -  ErrorControl=$($drv.ErrorCtlName)"
+                    if ($isAzureCritical) { $detail += ' (Azure/Hyper-V critical  -  will BSOD)' }
+                }
+                else {
+                    $vi = (Get-Item -LiteralPath $imgResolved -Force -ErrorAction SilentlyContinue).VersionInfo
+                    $vendor = if ($vi -and $vi.CompanyName) { $vi.CompanyName.Trim() } else { '' }
+                    if ($vendor -and $vendor -notmatch 'Microsoft') {
+                        $detail = "3rd-party ($vendor)"
+                    }
+                    else {
+                        $detail = "$('{0:N0}' -f $fileSize) bytes"
+                    }
+                }
+
+                Write-Host "  $symCHAIN      " -ForegroundColor DarkGray -NoNewline
+                switch ($health) {
+                    'OK'   { Write-Host "$symOK " -ForegroundColor Green -NoNewline }
+                    'WARN' { Write-Host "$symWARN " -ForegroundColor Yellow -NoNewline }
+                    'FAIL' { Write-Host "$symFAIL " -ForegroundColor Red -NoNewline }
+                }
+                Write-Host "$($drv.Name) ($($drv.Type))" -ForegroundColor White -NoNewline
+                if ($detail) { Write-Host "  $detail" -ForegroundColor DarkGray } else { Write-Host "" }
+
+                $totalChecks++
+                if ($health -eq 'FAIL') {
+                    $sysDriverFail++
+                    $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'FAIL'; Message = "System driver '$($drv.Name)': $detail"; Fix = "-RepairSystemFile $(Split-Path -Leaf $drv.ImagePath)" })
+                }
+                elseif ($health -eq 'WARN') {
+                    $sysDriverWarn++
+                    $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'WARN'; Message = "System driver '$($drv.Name)': $detail"; Fix = '' })
+                }
+            }
+            Write-Host "  $symCHAIN      -- $($sysDrivers.Count) system-start drivers ($sysDriverFail fail, $sysDriverWarn warn) --" -ForegroundColor DarkGray
+
+            # 4d. Auto-start services (Start=2)  -  launched by services.exe
+            Write-Host ""
+            Write-Host "  $symCHAIN  $symARROW  Auto-Start Services (Start=2)  -  launched by services.exe" -ForegroundColor White
+
+            $autoSvcFail = 0
+            $autoSvcWarn = 0
+            $autoSvcCount = 0
+            Get-ChildItem $svcPath -ErrorAction SilentlyContinue | ForEach-Object {
+                $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                if ($null -eq $p -or $null -eq $p.Start -or $null -eq $p.Type) { return }
+                if ([int]$p.Start -ne 2) { return }
+                if ([int]$p.Type -notin @(16, 32, 256)) { return }  # Win32 services only
+
+                $imgRaw = $p.ImagePath
+                $imgResolved = if ($imgRaw) { Resolve-GuestImagePath $imgRaw } else { $null }
+                $fileExists = if ($imgResolved) { Test-Path -LiteralPath $imgResolved } else { $false }
+                $fileSize = if ($fileExists) { (Get-Item -LiteralPath $imgResolved -Force -ErrorAction SilentlyContinue).Length } else { 0 }
+
+                $health = 'OK'
+                $detail = ''
+                if (-not $imgResolved -or -not $fileExists) {
+                    # svchost-hosted services may not have their own binary
+                    if ($imgRaw -match 'svchost\.exe') {
+                        $health = 'OK'
+                        $detail = 'svchost-hosted'
+                    }
+                    else {
+                        $health = 'WARN'
+                        $detail = "MISSING binary: $imgRaw"
+                    }
+                }
+                elseif ($fileSize -eq 0) {
+                    $health = 'WARN'
+                    $detail = '0 BYTES (corrupt)'
+                }
+
+                # Only show issues or first few OK to keep noise down
+                if ($health -ne 'OK') {
+                    Write-Host "  $symCHAIN      " -ForegroundColor DarkGray -NoNewline
+                    $icon = if ($health -eq 'FAIL') { $symFAIL } else { $symWARN }
+                    $col = if ($health -eq 'FAIL') { 'Red' } else { 'Yellow' }
+                    Write-Host "$icon " -ForegroundColor $col -NoNewline
+                    Write-Host "$($_.PSChildName)" -ForegroundColor White -NoNewline
+                    Write-Host "  $detail" -ForegroundColor DarkGray
+                    $totalChecks++
+                    if ($health -eq 'FAIL') { $autoSvcFail++ }
+                    else { $autoSvcWarn++ }
+                    $issues.Add([PSCustomObject]@{ Phase = 4; Severity = $health; Message = "Auto-start service '$($_.PSChildName)': $detail"; Fix = '' })
+                }
+                $autoSvcCount++
+            }
+            Write-Host "  $symCHAIN      -- $autoSvcCount auto-start services ($autoSvcFail fail, $autoSvcWarn warn) --" -ForegroundColor DarkGray
+
+            # 4e. Critical registry keys checked during kernel init
+            Write-Host ""
+            Write-Host "  $symCHAIN  $symARROW  Critical Registry Configuration" -ForegroundColor White
+
+            # ControlSet active check
+            $current = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue).Current
+            $default = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue).Default
+            $lastKnown = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue).LastKnownGood
+            if ($current) {
+                $csMatch = ($current -eq $default)
+                $csLabel = "Active ControlSet: ControlSet{0:d3} (Current=$current, Default=$default, LKGC=$lastKnown)" -f $current
+                Write-ChainItem -Label $csLabel -Status $(if ($csMatch) { 'OK' } else { 'INFO' }) -Detail $(if (-not $csMatch) { 'Current != Default (LKGC may have been used)' } else { '' })
+            }
+
+            # Memory Management  -  paging settings
+            $mmPath = "$sysRoot\Control\Session Manager\Memory Management"
+            if (Test-Path $mmPath) {
+                $mmProps = Get-ItemProperty $mmPath -ErrorAction SilentlyContinue
+                $pagingFiles = $mmProps.PagingFiles
+                if ($pagingFiles) {
+                    Write-ChainItem -Label "PagingFiles: $($pagingFiles -join '; ')" -Status 'INFO'
+                }
+                # Driver Verifier
+                $verifyDrivers = $mmProps.VerifyDrivers
+                $verifyLevel = $mmProps.VerifyDriverLevel
+                if ($verifyDrivers -or $verifyLevel) {
+                    Write-ChainItem -Label "Driver Verifier ACTIVE  -  Targets: $verifyDrivers (Level: $verifyLevel)" -Status 'WARN' -Detail 'Can cause BSODs if misconfigured'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 4; Severity = 'WARN'; Message = "Driver Verifier is active (targets: $verifyDrivers)"; Fix = '-DisableDriverVerifier' })
+                }
+            }
+
+            # CrashControl  -  dump settings
+            $ccPath = "$sysRoot\Control\CrashControl"
+            if (Test-Path $ccPath) {
+                $ccProps = Get-ItemProperty $ccPath -ErrorAction SilentlyContinue
+                $dumpType = switch ([int]$ccProps.CrashDumpEnabled) { 0 { 'None' }; 1 { 'Complete' }; 2 { 'Kernel' }; 3 { 'Small (minidump)' }; 7 { 'Automatic' }; default { "$($ccProps.CrashDumpEnabled)" } }
+                Write-ChainItem -Label "Crash Dump: $dumpType -> $($ccProps.DumpFile)" -Status 'INFO'
+            }
+        }  # End Invoke-WithHive SYSTEM
+
+        #endregion
+
+        #region ===================================================================
+        # PHASE 5  -  LOGON & DESKTOP: Winlogon, LogonUI, credentials, shell
+        #=========================================================================
+        Write-Phase 5 'LOGON & DESKTOP' 'Winlogon -> LogonUI -> Lsass credential validation -> Userinit -> Explorer shell'
+
+        # 5a. Logon-phase binaries
+        $logonFiles = @(
+            @{ Label = 'winlogon.exe (Windows Logon)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\winlogon.exe') }
+            @{ Label = 'LogonUI.exe (Logon UI)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\LogonUI.exe') }
+            @{ Label = 'lsass.exe (Security Authority)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\lsass.exe') }
+            @{ Label = 'userinit.exe (User Initialization)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\userinit.exe') }
+            @{ Label = 'explorer.exe (Windows Shell)'; Path = (Join-Path $script:WinDriveLetter 'Windows\explorer.exe') }
+            @{ Label = 'dwm.exe (Desktop Window Manager)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\dwm.exe') }
+            @{ Label = 'consent.exe (UAC Consent UI)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\consent.exe') }
+            @{ Label = 'mpssvc.dll (Windows Firewall)'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\mpssvc.dll') }
+        )
+        foreach ($lf in $logonFiles) {
+            $r = Test-BootFile -Path $lf.Path -Label $lf.Label
+            Write-ChainItem -Label $lf.Label -Status $r.Health -Detail $r.Detail
+            $totalChecks++
+            if ($r.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 5; Severity = $r.Health; Message = "$($lf.Label): $($r.Detail)"; Fix = "-RepairSystemFile $(Split-Path -Leaf $lf.Path)" }) }
+        }
+
+        # 5b. Winlogon registry settings (Shell, Userinit)
+        Write-Host ""
+        Write-Host "  $symCHAIN  $symARROW  Winlogon & Shell Configuration" -ForegroundColor White
+
+        Invoke-WithHive 'SOFTWARE' {
+            $wlPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+            if (Test-Path $wlPath) {
+                $wlProps = Get-ItemProperty $wlPath -ErrorAction SilentlyContinue
+
+                # Shell
+                $shell = $wlProps.Shell
+                if (-not $shell) {
+                    Write-ChainItem -Label 'Winlogon Shell: (not set)' -Status 'FAIL' -Detail 'No shell will launch after logon'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 5; Severity = 'FAIL'; Message = 'Winlogon Shell is not set'; Fix = '-FixWinlogon' })
+                }
+                elseif ($shell -ne 'explorer.exe') {
+                    Write-ChainItem -Label "Winlogon Shell: $shell" -Status 'WARN' -Detail "Non-default shell (expected 'explorer.exe')"
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 5; Severity = 'WARN'; Message = "Winlogon Shell is '$shell' (expected 'explorer.exe')"; Fix = '-FixWinlogon' })
+                }
+                else {
+                    Write-ChainItem -Label 'Winlogon Shell: explorer.exe' -Status 'OK'
+                }
+
+                # Userinit
+                $userinit = $wlProps.Userinit
+                $expectedUserinit = 'C:\Windows\system32\userinit.exe,'
+                if (-not $userinit) {
+                    Write-ChainItem -Label 'Winlogon Userinit: (not set)' -Status 'FAIL' -Detail 'Userinit missing  -  logon sequence will fail'
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 5; Severity = 'FAIL'; Message = 'Winlogon Userinit is not set'; Fix = '-FixWinlogon' })
+                }
+                elseif ($userinit -ne $expectedUserinit) {
+                    Write-ChainItem -Label "Winlogon Userinit: $userinit" -Status 'WARN' -Detail "Non-default (expected '$expectedUserinit')"
+                    $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 5; Severity = 'WARN'; Message = "Winlogon Userinit is '$userinit' (non-default)"; Fix = '-FixWinlogon' })
+                }
+                else {
+                    Write-ChainItem -Label "Winlogon Userinit: $userinit" -Status 'OK'
+                }
+
+                # GpExtensions / AppInit_DLLs  -  potential boot blockers
+                $appInitPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows'
+                if (Test-Path $appInitPath) {
+                    $appInitProps = Get-ItemProperty $appInitPath -ErrorAction SilentlyContinue
+                    $appInitDlls = $appInitProps.AppInit_DLLs
+                    $loadAppInit = $appInitProps.LoadAppInit_DLLs
+                    if ($loadAppInit -eq 1 -and $appInitDlls) {
+                        Write-ChainItem -Label "AppInit_DLLs ACTIVE: $appInitDlls" -Status 'WARN' -Detail 'Third-party DLLs injected into every process  -  common boot blocker'
+                        $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 5; Severity = 'WARN'; Message = "AppInit_DLLs loaded: $appInitDlls"; Fix = '' })
+                    }
+                }
+
+                # Credential providers
+                $cpPath = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers'
+                if (Test-Path $cpPath) {
+                    $cpCount = (Get-ChildItem $cpPath -ErrorAction SilentlyContinue).Count
+                    Write-ChainItem -Label "Credential Providers: $cpCount registered" -Status 'INFO'
+                }
+            }
+            else {
+                Write-ChainItem -Label 'Winlogon key' -Status 'FAIL' -Detail 'HKLM:\SOFTWARE\...\Winlogon not found'
+                $totalChecks++; $issues.Add([PSCustomObject]@{ Phase = 5; Severity = 'FAIL'; Message = 'Winlogon registry key not found'; Fix = '-RestoreRegistryFromRegBack' })
+            }
+
+            # 5c. Other critical SOFTWARE hive checks
+            # Run / RunOnce startup programs
+            $runPaths = @(
+                'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+                'HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+            )
+            foreach ($rp in $runPaths) {
+                if (-not (Test-Path $rp)) { continue }
+                $entries = Get-ItemProperty $rp -ErrorAction SilentlyContinue
+                $names = $entries.PSObject.Properties | Where-Object { $_.Name -notin @('PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider') }
+                if ($names.Count -gt 0) {
+                    $keyName = Split-Path -Leaf $rp
+                    $preview = ($names | Select-Object -First 3 | ForEach-Object { $_.Name }) -join ', '
+                    Write-ChainItem -Label "$keyName : $($names.Count) startup entries" -Status 'INFO' -Detail $preview
+                }
+            }
+        }  # End Invoke-WithHive SOFTWARE
+
+        # 5d. Additional registry hive files health (SOFTWARE, SAM, SECURITY)
+        Write-Host ""
+        Write-Host "  $symCHAIN  $symARROW  Registry Hive Files Health" -ForegroundColor White
+        $hiveFiles = @(
+            @{ Label = 'SOFTWARE hive'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\config\SOFTWARE') }
+            @{ Label = 'SAM hive'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\config\SAM') }
+            @{ Label = 'SECURITY hive'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\config\SECURITY') }
+            @{ Label = 'DEFAULT hive'; Path = (Join-Path $script:WinDriveLetter 'Windows\System32\config\DEFAULT') }
+        )
+        foreach ($hf in $hiveFiles) {
+            $r = Test-BootFile -Path $hf.Path -Label $hf.Label -SkipSignature
+            Write-ChainItem -Label $hf.Label -Status $r.Health -Detail $r.Detail
+            $totalChecks++
+            if ($r.Health -ne 'OK') { $issues.Add([PSCustomObject]@{ Phase = 5; Severity = $r.Health; Message = "$($hf.Label): $($r.Detail)"; Fix = '-RestoreRegistryFromRegBack' }) }
+        }
+
+        #endregion
+
+        #region ===================================================================
+        # SUMMARY
+        #=========================================================================
+        Write-Host ""
+        Write-Host "  $("$symEQ" * 76)" -ForegroundColor Cyan
+        Write-Host "                          BOOT PATH HEALTH SUMMARY" -ForegroundColor White
+        Write-Host "  $("$symEQ" * 76)" -ForegroundColor Cyan
+
+        $fails = @($issues | Where-Object { $_.Severity -eq 'FAIL' })
+        $warns = @($issues | Where-Object { $_.Severity -eq 'WARN' })
+
+        Write-Host ""
+        Write-Host "  Total checks performed : $totalChecks" -ForegroundColor White
+        Write-Host -NoNewline "  Critical failures      : "; Write-Host "$($fails.Count)" -ForegroundColor $(if ($fails.Count -gt 0) { 'Red' } else { 'Green' })
+        Write-Host -NoNewline "  Warnings               : "; Write-Host "$($warns.Count)" -ForegroundColor $(if ($warns.Count -gt 0) { 'Yellow' } else { 'Green' })
+
+        if ($fails.Count -eq 0 -and $warns.Count -eq 0) {
+            Write-Host ""
+            Write-Host "  $symOK  All boot path artifacts verified  -  boot chain looks healthy." -ForegroundColor Green
+        }
+        else {
+            if ($fails.Count -gt 0) {
+                Write-Host ""
+                Write-Host "  -- CRITICAL Issues (will prevent boot) --" -ForegroundColor Red
+                $phaseNames = @{ 1 = 'Pre-Boot'; 2 = 'Boot Manager'; 3 = 'OS Loader'; 4 = 'NTOS Kernel'; 5 = 'Logon & Desktop' }
+                foreach ($f in $fails) {
+                    $phaseName = $phaseNames[[int]$f.Phase]
+                    Write-Host "  $symFAIL  [Phase $($f.Phase) - $phaseName] $($f.Message)" -ForegroundColor Red
+                    if ($f.Fix) { Write-Host "           Fix: $($f.Fix)" -ForegroundColor Yellow }
+                }
+            }
+            if ($warns.Count -gt 0) {
+                Write-Host ""
+                Write-Host "  -- Warnings (may affect boot or indicate risk) --" -ForegroundColor Yellow
+                foreach ($w in $warns | Select-Object -First 15) {
+                    Write-Host "  $symWARN  [Phase $($w.Phase)] $($w.Message)" -ForegroundColor Yellow
+                    if ($w.Fix) { Write-Host "           Fix: $($w.Fix)" -ForegroundColor DarkYellow }
+                }
+                if ($warns.Count -gt 15) {
+                    Write-Host "  ... and $($warns.Count - 15) additional warnings." -ForegroundColor DarkGray
+                }
+            }
+        }
+
+        Write-Host ""
+        Write-Host "  Tip: Use -AnalyzeCriticalBootFiles for a quick file-only table, -AnalyzeBcdConsistency for detailed BCD." -ForegroundColor DarkGray
+        Write-Host "  $("$symEQ" * 76)" -ForegroundColor Cyan
+        Write-Host ""
+    }
+    # End GetBootPathReport
 
     function AnalyzeBcdConsistency {
         Write-Host "Analyzing BCD consistency..." -ForegroundColor Yellow
@@ -7207,6 +8428,7 @@ No destructive file or registry cleanup is performed.
         # ------------------------------------------------------------------
         # 1. Resolve VMName -> DiskNumber (Hyper-V path)
         # ------------------------------------------------------------------
+        $script:AutoMountedVHDPath = $null   # track if we auto-mounted a VHD for cleanup
         if (-not [string]::IsNullOrWhiteSpace($VMName)) {
             Write-Host "Resolving Hyper-V VM '$VMName'..." -ForegroundColor Cyan
 
@@ -7225,20 +8447,58 @@ No destructive file or registry cleanup is performed.
                 Start-Sleep -Seconds 2
             }
 
-            # Primary: use controller 0:0 DiskNumber (Hyper-V populates this when VHD is attached)
+            # Resolve VM hard drive -> physical disk number
+            # Strategy: Get-VHD (authoritative) -> HardDrive.DiskNumber (cross-validated) -> auto-mount
             $osDrive = $vm.HardDrives | Where-Object { $_.ControllerNumber -eq 0 -and $_.ControllerLocation -eq 0 }
-            $DiskNumber = if ($osDrive) { $osDrive.DiskNumber } else { -1 }
+            if (-not $osDrive) { $osDrive = $vm.HardDrives | Select-Object -First 1 }
+            if (-not $osDrive -or -not $osDrive.Path) {
+                Write-Error "VM '$VMName' has no hard drives attached."
+                return $false
+            }
+            $vhdPath = $osDrive.Path
+            $DiskNumber = -1
 
-            # Fallback: Get-VHD exposes DiskNumber when the VHD is mounted as a loopback disk
-            if ($null -eq $DiskNumber -or $DiskNumber -lt 0) {
-                foreach ($vhdDrive in ($vm | Get-VMHardDiskDrive)) {
-                    $vhd = Get-VHD -Path $vhdDrive.Path -ErrorAction SilentlyContinue
-                    if ($vhd -and $null -ne $vhd.DiskNumber -and $vhd.DiskNumber -ge 0) {
-                        $DiskNumber = $vhd.DiskNumber
-                        Write-Host "Matched disk $DiskNumber via Get-VHD: $($vhdDrive.Path)" -ForegroundColor Green
-                        break
+            # 1) Authoritative: Get-VHD tells us the real disk number when the VHD is mounted
+            if (Test-Path -LiteralPath $vhdPath) {
+                $vhd = Get-VHD -Path $vhdPath -ErrorAction SilentlyContinue
+                if ($vhd -and $null -ne $vhd.DiskNumber -and [int]$vhd.DiskNumber -ge 0) {
+                    $DiskNumber = [int]$vhd.DiskNumber
+                }
+            }
+
+            # 2) Cross-validate HardDrive.DiskNumber -- Hyper-V returns 0 as default when
+            #    the VHD is not mounted, which would incorrectly point at the host OS disk.
+            if ($DiskNumber -lt 0 -and $null -ne $osDrive.DiskNumber -and [int]$osDrive.DiskNumber -ge 0) {
+                $rawNum = [int]$osDrive.DiskNumber
+                # Reject if it matches the local OS disk (almost certainly a false default)
+                if ($null -ne $script:LocalOsDiskNumber -and $rawNum -eq $script:LocalOsDiskNumber) {
+                    Write-Host "  Hyper-V reports DiskNumber=$rawNum for this VM, but that is the local OS disk - ignoring." -ForegroundColor DarkYellow
+                }
+                else {
+                    $DiskNumber = $rawNum
+                }
+            }
+
+            # 3) VHD exists on disk but is not mounted -- auto-mount it
+            if ($DiskNumber -lt 0 -and (Test-Path -LiteralPath $vhdPath)) {
+                Write-Host "VM disk is not mounted on the host. Mounting VHD: $vhdPath..." -ForegroundColor Cyan
+                try {
+                    Mount-VHD -Path $vhdPath -ErrorAction Stop
+                    Start-Sleep -Seconds 2
+                    $vhd = Get-VHD -Path $vhdPath -ErrorAction SilentlyContinue
+                    if ($vhd -and $null -ne $vhd.DiskNumber -and [int]$vhd.DiskNumber -ge 0) {
+                        $DiskNumber = [int]$vhd.DiskNumber
+                        $script:AutoMountedVHDPath = $vhdPath
+                        Write-Host "  Mounted as Disk $DiskNumber" -ForegroundColor Green
                     }
                 }
+                catch {
+                    Write-Error "Failed to mount VHD '$vhdPath': $_"
+                }
+            }
+            elseif ($DiskNumber -lt 0 -and -not (Test-Path -LiteralPath $vhdPath)) {
+                Write-Error "VM disk path not found: $vhdPath"
+                return $false
             }
 
             if ($null -eq $DiskNumber -or $DiskNumber -lt 0) {
@@ -7508,6 +8768,7 @@ No destructive file or registry cleanup is performed.
             [switch]$DisableCredentialGuard,
             [switch]$EnableCredentialGuard,
             [switch]$DisableAppLocker,
+            [switch]$GetAppLockerReport,
             [switch]$FixSanPolicy,
             [switch]$FixAzureGuestAgent,
             [switch]$InstallAzureVMAgent,
@@ -7531,6 +8792,7 @@ No destructive file or registry cleanup is performed.
             [switch]$ResetInterfacesToDHCP,
             [switch]$AnalyzeProxyState,
             [switch]$ClearProxyState,
+            [switch]$GetBootPathReport,
             [switch]$AnalyzeBcdConsistency,
             [switch]$AnalyzeServicingState,
             [switch]$AnalyzeDomainTrustState,
@@ -7590,6 +8852,9 @@ PARAMETERS:
   -AnalyzeSyntheticDrivers  Validate Azure/Hyper-V synthetic drivers (vmbus/storvsc/netvsc)
   -AnalyzeProxyState     Show machine proxy/PAC settings that may block remote management
   -AnalyzeBcdConsistency Validate BCD loader/device/path consistency for current boot mode
+  -GetBootPathReport     Full boot chain health check: traces all 5 boot phases (Pre-Boot -> Boot Manager
+                           -> OS Loader -> NTOS Kernel -> Logon) validating every file, driver, and registry
+                           setting in load order with signature verification and fix suggestions
   -AnalyzeDomainTrustState  Assess likely domain-join/trust indicators from offline registry
   -ListStartupPrograms   List all auto-start programs (Run/RunOnce/Startup folders/Setup CmdLine)
   -ScanNetBindings       Report third-party network binding components (non-ms_ ComponentId)
@@ -7669,6 +8934,7 @@ PARAMETERS:
 
 --- SECURITY ------------------------------------------------------------------
   -DisableAppLocker            Disable AppLocker enforcement and AppIDSvc (fixes boot blocked by bad policy)
+  -GetAppLockerReport          Show AppLocker enforcement state, AppIDSvc config, and parsed rules per collection
   -DisableCredentialGuard      Disable Credential Guard and LSA protection
   -EnableCredentialGuard       Re-enable Credential Guard and LSA protection
   -FixWinlogon                 Reset Winlogon Shell/Userinit to Windows defaults (fixes black screen)
@@ -7756,7 +9022,7 @@ AVAILABLE DISKS:
 
         # Initialize logging and target (resolve VM/disk, bring disk online, detect partitions)
         # Determine if any write/repair action was requested (exclude pure read-only switches)
-        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeDomainTrustState')
+        $readOnlySwitches = @('SysCheck', 'CheckDiskHealth', 'ScanNetBindings', 'CheckRDPPolicies', 'CollectEventLogs', 'CollectMinidumps', 'ShowLastSession', 'GetServicesReport', 'GetAppLockerReport', 'ListInstalledUpdates', 'ListStartupPrograms', 'AnalyzeCriticalBootFiles', 'AnalyzeSyntheticDrivers', 'AnalyzeProxyState', 'GetBootPathReport', 'AnalyzeBcdConsistency', 'AnalyzeComponentStore', 'AnalyzeServicingState', 'AnalyzeDomainTrustState')
         $hasRepairAction = $PSBoundParameters.Keys | Where-Object { $readOnlySwitches -notcontains $_ -and $_ -notin @('VMName', 'DiskNumber', 'LeaveDiskOnline', 'DriveLetter', 'RepairSource', 'IncludeServices', 'IssuesOnly', 'KeepDefaultFilters', 'DriverStartType', 'LoadHive', 'UnloadHive') }
         if ($hasRepairAction) {
             Write-Host "  Tip: if you haven't already, a VM snapshot or disk backup before making changes is always a safe starting point." -ForegroundColor DarkGray
@@ -7766,26 +9032,11 @@ AVAILABLE DISKS:
             return
         }
 
-        # Resolve guest computer name from the offline SYSTEM hive (for log entries)
-        # Skip when only -LoadHive/-UnloadHive was requested (avoid loading SYSTEM just for name)
+        # Guest computer name is captured opportunistically by Invoke-WithHive
+        # the first time the SYSTEM hive is loaded for any action.
         $script:GuestComputerName = ''
-        $hiveOnlyAction = ($UnloadHive.Count -gt 0 -or $LoadHive.Count -gt 0) -and -not $hasRepairAction -and
-        -not ($PSBoundParameters.Keys | Where-Object { $readOnlySwitches -contains $_ })
-        if (-not $hiveOnlyAction) {
-            try {
-                Invoke-WithHive 'SYSTEM' {
-                    $sysRoot = Get-SystemRootPath
-                    $script:GuestComputerName = (Get-ItemProperty "$sysRoot\Control\ComputerName\ComputerName" -ErrorAction SilentlyContinue).ComputerName
-                }
-            }
-            catch { $script:GuestComputerName = '' }
-        }
-        if ($script:GuestComputerName) {
-            Write-Host "[OK] Guest name   : $($script:GuestComputerName)" -ForegroundColor Green
-            Write-Host ""
-        }
 
-        # Log session start after disk and guest name are resolved so they appear in every entry
+        # Log session start after disk is resolved so disk info appears in every entry
         Start-ActionLog "Repair-OfflineDisk start"
 
         try {
@@ -7838,6 +9089,7 @@ AVAILABLE DISKS:
             if ($DisableCredentialGuard) { DisableCredentialGuard }
             if ($EnableCredentialGuard) { EnableCredentialGuard }
             if ($DisableAppLocker) { DisableAppLocker }
+            if ($GetAppLockerReport) { GetAppLockerReport }
             if ($FixSanPolicy) { FixSanPolicy }
             if ($FixAzureGuestAgent) { FixAzureGuestAgent }
             if ($InstallAzureVMAgent) { InstallAzureVMAgentOffline }
@@ -7859,6 +9111,7 @@ AVAILABLE DISKS:
             if ($ResetInterfacesToDHCP) { ResetInterfacesToDHCP }
             if ($AnalyzeProxyState) { AnalyzeProxyState }
             if ($ClearProxyState) { ClearProxyState }
+            if ($GetBootPathReport) { GetBootPathReport }
             if ($AnalyzeBcdConsistency) { AnalyzeBcdConsistency }
             if ($AnalyzeServicingState) { AnalyzeServicingState }
             if ($AnalyzeDomainTrustState) { AnalyzeDomainTrustState }
@@ -7912,6 +9165,19 @@ AVAILABLE DISKS:
                 }
                 catch {
                     Write-Warning "Could not set disk $script:DiskNumber offline: $_"
+                }
+
+                # Dismount VHD if we auto-mounted it (prevents "file locked" when starting the VM)
+                if ($script:AutoMountedVHDPath) {
+                    Write-Host "Dismounting auto-mounted VHD: $($script:AutoMountedVHDPath)..."
+                    try {
+                        Dismount-VHD -Path $script:AutoMountedVHDPath -ErrorAction Stop
+                        Write-Host "[OK] VHD dismounted." -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Warning "Could not dismount VHD: $_"
+                    }
+                    $script:AutoMountedVHDPath = $null
                 }
             }
         }
