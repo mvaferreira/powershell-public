@@ -4230,6 +4230,7 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         $sevRdpSecProtoNeg = 1   # fAllowSecProtocolNegotiation=0
         $sevRdpMinEncLevel = 1   # MinEncryptionLevel below 2
         $sevRdpTcpKeyMissing = 1   # RDP-Tcp WinStation key not found
+        $sevRdpMaxInstanceZero = 2   # MaxInstanceCount=0 (RDP refuses all connections)
         $sevRdpCryptoSvcDisabled = 1   # KeyIso/CryptSvc/CertPropSvc disabled
         $sevRdpTlsDisabled = 1   # TLS 1.2 explicitly disabled in SCHANNEL
         $sevRdpNtlmRestrict = 1   # NTLM restrictions may block RDP auth
@@ -4262,6 +4263,9 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         $sevBfeDisabled = 1   # BFE (Base Filtering Engine) disabled
         $sevTcpipDisabled = 2   # Tcpip service disabled
         $sevNetSvcDisabled = 1   # Secondary networking services disabled (DNS/DHCP/NLA/SMB)
+        $sevNsiDisabled = 2   # nsi (Network Store Interface) disabled - total networking loss
+        $sevStaticIpNoAzureDhcp = 2   # EnableDHCP=0 on NIC - VM gets no Azure IP assignment
+        $sevNetProviderOrphaned = 2   # NetworkProvider\Order lists a provider whose DLL is missing - logon hangs forever
         $sevSanPolicy = 0   # SAN policy is not OnlineAll
         $sevOrphanedNdis = 2   # Orphaned NDIS bindings with missing binary
 
@@ -4299,6 +4303,12 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         $sevFirewallEnabled = 0   # Firewall is enabled (normal; INFO only)
         $sevFirewallRdpBlocked = 1   # No inbound RDP rule enabled in firewall
 
+        # Image File Execution Options (IFEO)
+        $sevIFEODebugger = 2   # IFEO Debugger set on critical service binary (prevents service from starting)
+        $sevIFEODebuggerNonCritical = 1   # IFEO Debugger set on non-critical executable
+        $sevIFEOGlobalFlag = 2   # IFEO GlobalFlag on critical exe (page heap/app verifier can crash or OOM services)
+        $sevIFEOGlobalFlagNonCritical = 1   # IFEO GlobalFlag on non-critical executable
+
         # Startup Programs
         $sevStartupPrograms = 0   # Third-party auto-start programs found
 
@@ -4315,6 +4325,8 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
         $sevBcdNoIntegrityChecks = 2   # nointegritychecks ON - fatal with Secure Boot
         $sevSecureBootConflict = 2   # testsigning/nointegritychecks ON while guest had Secure Boot
         $sevSecureBootState = 0   # Secure Boot was previously enabled (informational)
+        $sevSecureBootCertNotUpdated = 1   # Secure Boot enabled but 2023 certs not applied (expires Jun-Oct 2026)
+        $sevSecureBootCertError = 1   # Error during Secure Boot certificate update process
         $sevDeviceGuardVbs = 0   # VBS is enabled (informational)
         $sevDeviceGuardPlatReq = 1   # RequirePlatformSecurityFeatures=3 (requires DMA protection)
         $sevHvciEnabled = 0   # HVCI is enabled (informational)
@@ -4913,6 +4925,12 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                         & $emit 'RDP' 'OK' 'RDP SSL certificate thumbprint is present'
                     }
                     # No thumbprint = not flagged; Windows auto-generates one at first RDP connection
+
+                    # MaxInstanceCount - if 0, RDP refuses every connection attempt
+                    $maxInst = $rdpP.MaxInstanceCount
+                    if ($null -ne $maxInst -and $maxInst -eq 0) {
+                        & $emit 'RDP' (& $toSev $sevRdpMaxInstanceZero) "MaxInstanceCount=0 on RDP-Tcp - RDP will refuse ALL connections; run -FixRDP to reset" "-FixRDP"
+                    }
                 }
                 else {
                     & $emit 'RDP' (& $toSev $sevRdpTcpKeyMissing) 'RDP-Tcp WinStation key not found - RDP listener may be misconfigured' "-FixRDP"
@@ -4998,6 +5016,12 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                 $tcpStart = (Get-ItemProperty "$svcRoot\Tcpip" -ErrorAction SilentlyContinue).Start
                 if ($tcpStart -eq 4) {
                     & $emit 'Networking' (& $toSev $sevTcpipDisabled) 'Tcpip service is DISABLED - no network will be available' "-ResetNetworkStack"
+                }
+
+                # nsi (Network Store Interface) - core TCP/IP dependency; if disabled, zero networking
+                $nsiStart = (Get-ItemProperty "$svcRoot\nsi" -ErrorAction SilentlyContinue).Start
+                if ($nsiStart -eq 4) {
+                    & $emit 'Networking' (& $toSev $sevNsiDisabled) "nsi (Network Store Interface) is DISABLED - TCP/IP stack is non-functional; all networking will fail" "-EnableDriverOrService nsi"
                 }
 
                 # Additional networking services
@@ -5208,6 +5232,52 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                         & $emit 'UEFI' 'INFO' 'SecureBoot\\State key not found - guest may not have booted with UEFI Secure Boot awareness'
                     }
 
+                    # Secure Boot 2023 certificate update status (registry snapshot from last boot on real firmware)
+                    $sbServicingPath = "$ctrlRoot\SecureBoot\Servicing"
+                    $sbMainPath = "$ctrlRoot\SecureBoot"
+                    $hvCaveat = '(Note: these registry values reflect the last boot environment; if this VM was previously booted as nested on Hyper-V, these values may reflect Hyper-V firmware, not the original Azure VM)'
+                    if ($sbEnabled -eq 1) {
+                        # UEFICA2023Status
+                        if (Test-Path $sbServicingPath) {
+                            $sbServProps = Get-ItemProperty $sbServicingPath -ErrorAction SilentlyContinue
+                            $certStatus = $sbServProps.UEFICA2023Status
+                            if ($certStatus -eq 'Updated') {
+                                & $emit 'UEFI' 'INFO' 'Secure Boot 2023 certificates were applied (UEFICA2023Status=Updated)'
+                            }
+                            elseif ($null -ne $certStatus) {
+                                & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot 2023 certificates not yet applied (UEFICA2023Status=$certStatus) - certificates expire Jun-Oct 2026. $hvCaveat"
+                            }
+                            else {
+                                & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot enabled but UEFICA2023Status not set - 2023 certificate update may not have started. $hvCaveat"
+                            }
+                            # UEFICA2023Error
+                            $certError = $sbServProps.UEFICA2023Error
+                            if ($null -ne $certError) {
+                                $certErrorEvent = $sbServProps.UEFICA2023ErrorEvent
+                                $errorDetail = "Secure Boot certificate update error detected (UEFICA2023Error=$certError)"
+                                if ($null -ne $certErrorEvent) { $errorDetail += " (ErrorEvent=$certErrorEvent)" }
+                                $errorDetail += ". $hvCaveat"
+                                & $emit 'UEFI' (& $toSev $sevSecureBootCertError) $errorDetail
+                            }
+                        }
+                        else {
+                            & $emit 'UEFI' (& $toSev $sevSecureBootCertNotUpdated) "Secure Boot enabled but SecureBoot\Servicing key absent - 2023 certificate update status unknown. $hvCaveat"
+                        }
+                        # AvailableUpdates bitmask (informational)
+                        if (Test-Path $sbMainPath) {
+                            $availUpdates = (Get-ItemProperty $sbMainPath -ErrorAction SilentlyContinue).AvailableUpdates
+                            if ($null -ne $availUpdates) {
+                                $availHex = '0x{0:X}' -f [int]$availUpdates
+                                if ($availUpdates -eq 0 -or $availUpdates -eq 0x4000) {
+                                    & $emit 'UEFI' 'INFO' "Secure Boot AvailableUpdates=$availHex - all certificate update steps completed"
+                                }
+                                else {
+                                    & $emit 'UEFI' 'INFO' "Secure Boot AvailableUpdates=$availHex - certificate update steps still pending (0x40=DB, 0x800/0x1000=3P certs, 0x4=KEK, 0x100=boot mgr)"
+                                }
+                            }
+                        }
+                    }
+
                     # VBS / DeviceGuard configuration
                     $dgPath = "$ctrlRoot\DeviceGuard"
                     if (Test-Path $dgPath) {
@@ -5353,6 +5423,53 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                     if ($globalNs) { $staticDns.Add("Global: $globalNs") }
                     if ($staticDns.Count -gt 0) {
                         & $emit 'Networking' (& $toSev $sevStaticDns) "Static DNS server(s) configured on $($staticDns.Count) interface(s) - may not resolve after migration; -ResetNetworkStack clears them" "-ResetNetworkStack"
+                    }
+                }
+
+                # -- Static IP / DHCP disabled ----------------------------------------
+                # Azure requires DHCP for IP assignment. EnableDHCP=0 means the VM
+                # keeps a stale on-prem IP and gets zero Azure connectivity.
+                if (Test-Path $ifBase) {
+                    $staticIpIfs = [System.Collections.Generic.List[string]]::new()
+                    Get-ChildItem $ifBase -ErrorAction SilentlyContinue | ForEach-Object {
+                        $dhcpVal = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).EnableDHCP
+                        if ($null -ne $dhcpVal -and $dhcpVal -eq 0) {
+                            $staticIpIfs.Add($_.PSChildName)
+                        }
+                    }
+                    if ($staticIpIfs.Count -gt 0) {
+                        & $emit 'Networking' (& $toSev $sevStaticIpNoAzureDhcp) "EnableDHCP=0 on $($staticIpIfs.Count) interface(s) - Azure requires DHCP for IP assignment; VM will have NO connectivity; run -ResetInterfacesToDHCP" "-ResetInterfacesToDHCP"
+                    }
+                }
+
+                # -- NetworkProvider\Order orphan check --------------------------------
+                # If a provider is listed in ProviderOrder but its DLL is missing,
+                # Windows hangs indefinitely at logon ("Please wait..." forever).
+                # Common after uninstalling VPN software (Cisco AnyConnect, GlobalProtect, Zscaler).
+                $npOrderPath = "$ctrlRoot\NetworkProvider\Order"
+                if (Test-Path $npOrderPath) {
+                    $providerOrder = (Get-ItemProperty $npOrderPath -ErrorAction SilentlyContinue).ProviderOrder
+                    if ($providerOrder) {
+                        $providers = $providerOrder -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                        $orphanedProviders = [System.Collections.Generic.List[string]]::new()
+                        foreach ($prov in $providers) {
+                            $provSvcPath = "$svcRoot\$prov\NetworkProvider"
+                            if (-not (Test-Path $provSvcPath)) {
+                                $orphanedProviders.Add("$prov (service key missing)")
+                                continue
+                            }
+                            $provDllRaw = (Get-ItemProperty $provSvcPath -ErrorAction SilentlyContinue).ProviderPath
+                            if (-not $provDllRaw) { continue }
+                            # Resolve %SystemRoot% and map to offline drive
+                            $provDll = $provDllRaw -replace '(?i)%SystemRoot%', (Join-Path $script:WinDriveLetter 'Windows')
+                            $provDll = $provDll -replace '(?i)\\SystemRoot\\', (Join-Path $script:WinDriveLetter 'Windows\')
+                            if (-not (Test-Path -LiteralPath $provDll)) {
+                                $orphanedProviders.Add("$prov ($provDllRaw -> not found)")
+                            }
+                        }
+                        if ($orphanedProviders.Count -gt 0) {
+                            & $emit 'Networking' (& $toSev $sevNetProviderOrphaned) "NetworkProvider\Order lists $($orphanedProviders.Count) provider(s) with missing DLL - logon will hang indefinitely: $($orphanedProviders -join '; ')" "-FixNetBindings"
+                        }
                     }
                 }
 
@@ -5564,6 +5681,79 @@ Revert commands are printed after completion, or use -EnableThirdPartyDrivers.
                         if ($null -ne $pfState -and ($pfState -band 0x8)) {
                             & $emit 'UserProfile' (& $toSev $sevProfileTempFlag) "Profile SID $sid has temporary profile flag (State=$pfState) - user gets temporary profile on each logon" "-FixProfileLoad"
                         }
+                    }
+                }
+
+                # -- Image File Execution Options (IFEO) ------------------------------------
+                # IFEO keys can contain values that prevent or break process execution:
+                #   Debugger     - replaces the process entirely with a debugger; if that binary
+                #                  is missing (procdump uninstalled), the service silently fails.
+                #   GlobalFlag   - gflags.exe settings. Dangerous flags include:
+                #                  0x02000000 = page heap (massive memory, OOM crashes)
+                #                  0x00000100 = Application Verifier (crashes if verifier DLLs removed)
+                #                  0x00000040 = validate all heap (extreme slowdown -> SCM timeout)
+                #   MitigationOptions - forces DEP/ASLR/CFG/SEHOP on binaries that may not
+                #                  be compiled for them, causing access violations.
+                $ifeoRoot = 'HKLM:\BROKENSOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+                if (Test-Path $ifeoRoot) {
+                    # Critical executables whose IFEO entries would prevent boot or core services
+                    $ifeoCriticalExes = @(
+                        'svchost.exe', 'services.exe', 'lsass.exe', 'smss.exe', 'csrss.exe',
+                        'wininit.exe', 'winlogon.exe', 'logonui.exe', 'dwm.exe',
+                        'spoolsv.exe', 'lsm.exe', 'userinit.exe', 'explorer.exe',
+                        'rdpclip.exe', 'rdpinit.exe', 'mstsc.exe', 'termsrv.dll',
+                        'WaAppAgent.exe', 'WindowsAzureGuestAgent.exe',
+                        'WaSecAgentProv.exe'
+                    )
+                    # GlobalFlag bits that are known to crash or OOM services
+                    $dangerousGFlags = @(
+                        @{ Mask = 0x02000000; Name = 'FLG_HEAP_PAGE_ALLOCS (page heap)'; Risk = 'massive memory overhead - causes OOM on constrained services' }
+                        @{ Mask = 0x00000100; Name = 'FLG_APPLICATION_VERIFIER'; Risk = 'crashes if Application Verifier provider DLLs are missing' }
+                        @{ Mask = 0x00000040; Name = 'FLG_HEAP_VALIDATE_ALL'; Risk = 'validates every heap operation - extreme slowdown causes SCM timeout' }
+                        @{ Mask = 0x00001000; Name = 'FLG_USER_STACK_TRACE_DB'; Risk = 'stack trace database - significant memory overhead' }
+                    )
+                    $ifeoCount = 0
+                    foreach ($ifeoKey in (Get-ChildItem $ifeoRoot -ErrorAction SilentlyContinue)) {
+                        $ifeoProps = Get-ItemProperty $ifeoKey.PSPath -ErrorAction SilentlyContinue
+                        $exeName = $ifeoKey.PSChildName
+                        $isCritical = $ifeoCriticalExes -contains $exeName
+
+                        # 1. Debugger redirect (most severe - process never runs)
+                        $ifeoDebugger = $ifeoProps.Debugger
+                        if ($ifeoDebugger) {
+                            $dbgBin = ($ifeoDebugger -split '\s+', 2)[0].Trim('"')
+                            $dbgResolved = if ($dbgBin -match '^[A-Z]:\\') {
+                                $dbgBin -replace '^[A-Z]:\\', "$($script:WinDriveLetter)"
+                            } else { $null }
+                            $dbgExists = $dbgResolved -and (Test-Path -LiteralPath $dbgResolved)
+                            $existsTag = if ($dbgResolved) { if ($dbgExists) { 'binary exists' } else { 'BINARY MISSING' } } else { 'path not resolvable' }
+                            $sev = if ($isCritical) { (& $toSev $sevIFEODebugger) } else { (& $toSev $sevIFEODebuggerNonCritical) }
+                            $impact = if ($isCritical) { 'CRITICAL - service/process will not start' } else { 'process will launch debugger instead of running normally' }
+                            & $emit 'IFEO' $sev "IFEO Debugger on $exeName -> '$ifeoDebugger' ($existsTag) - $impact"
+                            $ifeoCount++
+                        }
+
+                        # 2. GlobalFlag (second most common - gflags/page heap/app verifier leftovers)
+                        $gfValue = $ifeoProps.GlobalFlag
+                        if ($null -ne $gfValue -and [int]$gfValue -ne 0) {
+                            $gfInt = [int]$gfValue
+                            $gfHex = '0x{0:X8}' -f $gfInt
+                            $hitFlags = @()
+                            foreach ($df in $dangerousGFlags) {
+                                if ($gfInt -band $df.Mask) { $hitFlags += "$($df.Name) - $($df.Risk)" }
+                            }
+                            if ($hitFlags.Count -gt 0) {
+                                $sev = if ($isCritical) { (& $toSev $sevIFEOGlobalFlag) } else { (& $toSev $sevIFEOGlobalFlagNonCritical) }
+                                foreach ($hf in $hitFlags) {
+                                    & $emit 'IFEO' $sev "IFEO GlobalFlag on $exeName ($gfHex): $hf"
+                                }
+                                $ifeoCount++
+                            }
+                        }
+
+                    }
+                    if ($ifeoCount -eq 0) {
+                        & $emit 'IFEO' 'OK' 'No IFEO debugger redirects or GlobalFlag overrides found'
                     }
                 }
 
